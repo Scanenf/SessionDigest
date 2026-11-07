@@ -886,6 +886,7 @@ class TestPrivacyScanCoverage(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         cfg = make_cfg(tmp)
         cfg.verbose = True
+        cfg.projects = {"shop": "邵哨兵项目"}
         src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
         lines = claude_lines("sid-p", 3)
         lines[0]["message"]["content"][0]["text"] = (
