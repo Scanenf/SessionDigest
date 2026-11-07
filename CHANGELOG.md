@@ -25,6 +25,12 @@
   `BlockingIOError`；`--preview` 非 dry-run 也会先取锁；`--export --dry-run`
   真正零写入（不建目录、不写索引、不生成密钥、不加锁）。
 
+### 许可证
+
+- 从 MIT 改为 GNU General Public License v3.0 or later
+  （`GPL-3.0-or-later`）。已经按 MIT 发布的旧版本仍然有效；新版本要求
+  分发衍生作品时继续开源。版权人为 `Scanenf`。
+
 ### 兼容性
 
 - 读取 v0.1 state（无 offset，补签偏移）、v0.2–v0.4 state（偏移与章节数不变）、

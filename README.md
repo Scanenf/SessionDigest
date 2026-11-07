@@ -614,4 +614,11 @@ HTTP 服务，不访问外网。
 
 ## License
 
-[MIT](LICENSE)
+[GNU General Public License v3.0 or later](LICENSE)（`GPL-3.0-or-later`）。
+
+你可以自由使用、修改、分发，也可以收费；但如果分发修改后的版本，
+必须继续使用 GPL-3.0（或更高版本）并公开对应源码。版权归
+`Copyright (C) 2026 Scanenf` 所有。
+
+这不是法律建议。GPL 本身允许商业使用；如果你需要不受 GPL 约束的闭源
+商业授权，请联系作者。

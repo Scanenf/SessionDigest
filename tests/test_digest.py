@@ -1480,7 +1480,14 @@ class TestRepoHygiene(unittest.TestCase):
     def test_license_and_readme_privacy_wording(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "LICENSE"), encoding="utf-8") as f:
-            self.assertIn("Copyright (c) 2026 Scannef", f.read())
+            license_text = f.read()
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 29 June 2007", license_text)
+        with open(os.path.join(root, "session_digest.py"),
+                  encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("Copyright (C) 2026 Scanenf", source)
+        self.assertIn("SPDX-License-Identifier: GPL-3.0-or-later", source)
         with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
             readme = f.read()
         self.assertIn("风险降低措施，不是安全边界", readme)
