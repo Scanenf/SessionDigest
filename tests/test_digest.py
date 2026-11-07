@@ -156,6 +156,84 @@ class TestVerify(unittest.TestCase):
         self.assertIn("`nope` ⚠", out)
 
 
+class TestRedact(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            sd, "_local_usernames", return_value=["邵长荣", "shaorong"])
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_masks_credentials(self):
+        raw = ("key sk-ant-api03-abcdefghijklmnop\n"
+               "token=abc123456789\n"
+               "Authorization: Bearer abcdefgh12345678\n"
+               "ghp_abcdefghijklmnopqrstuvwxyz\n")
+        out = sd.redact_text(raw, "safe")
+        for secret in ("sk-ant-api03-abcdefghijklmnop",
+                       "abc123456789",
+                       "abcdefgh12345678",
+                       "ghp_abcdefghijklmnopqrstuvwxyz"):
+            self.assertNotIn(secret, out)
+        self.assertIn("token=***", out)
+
+    def test_masks_json_style_secret(self):
+        out = sd.redact_text('{"password": "hunter2hunter2"}', "safe")
+        self.assertNotIn("hunter2hunter2", out)
+        self.assertIn('"password": "***"', out)
+
+    def test_masks_email_and_private_ip(self):
+        out = sd.redact_text("联系 a.b@example.com，或 192.168.1.20", "safe")
+        self.assertIn("<email>", out)
+        self.assertIn("<private-ip>", out)
+        self.assertNotIn("192.168.1.20", out)
+
+    def test_strict_replaces_home_prefix(self):
+        cases = [
+            (r"C:\Users\邵长荣\proj\a.py", r"~\proj\a.py"),
+            ("C:/Users/shaorong/proj/a.py", "~/proj/a.py"),
+            ("/home/shaorong/proj/a.py", "~/proj/a.py"),
+            ("/Users/shaorong/proj/a.py", "~/proj/a.py"),
+            ("/c/Users/邵长荣/proj/a.py", "~/proj/a.py"),
+        ]
+        for raw, want in cases:
+            self.assertEqual(sd.redact_text(raw, "strict"), want)
+
+    def test_safe_and_off_keep_paths(self):
+        path = r"C:\Users\邵长荣\proj\a.py"
+        self.assertEqual(sd.redact_text(path, "safe"), path)
+        self.assertEqual(sd.redact_text(path, "off"), path)
+
+    def test_strict_masks_standalone_username(self):
+        self.assertEqual(sd.redact_text("邵长荣的电脑", "strict"), "~的电脑")
+
+    def test_transcript_is_redacted_before_model_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            info = sd._blank_info("claude")
+            info["prompts"] = [
+                "key 是 sk-ant-api03-abcdefghijklmnop，路径 "
+                r"C:\Users\邵长荣\proj\a.py"]
+            captured = {}
+
+            def fake_call(cfg, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return "ok", {}
+
+            with mock.patch.object(sd, "call_llm", side_effect=fake_call):
+                sd.summarize_one(cfg, info, "shop")
+            self.assertNotIn("sk-ant-api03", captured["prompt"])
+            self.assertNotIn("邵长荣", captured["prompt"])
+            self.assertIn(r"~\proj\a.py", captured["prompt"])
+
+    def test_failure_errors_are_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            sd.record_failure(cfg, "sid-z", "/src.jsonl",
+                              "401 sk-ant-api03-abcdefghijklmnop", "claude")
+            saved = sd.load_failures(cfg)["sid-z"]["error"]
+            self.assertNotIn("sk-ant-api03", saved)
+
+
 class TestBlocks(unittest.TestCase):
     def setUp(self):
         self.text = (

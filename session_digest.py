@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,7 @@ class Config:
     min_delta_chars: int = 500
     force: bool = False
     verify: bool = True
+    redact: str = "strict"
     verbose: bool = False
 
 
@@ -208,6 +209,99 @@ def lock_or_report(cfg: Config) -> Optional[ProcessLock]:
           f"等它结束后再试；如果确认没有进程在跑，删掉该文件即可。",
           file=sys.stderr)
     return None
+
+
+# ---------------------------------------------------------------------------
+# 脱敏
+# ---------------------------------------------------------------------------
+
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.S)
+_URL_AUTH_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@")
+_TOKEN_RES = [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{10,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{10,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+]
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}")
+_ASSIGN_RE = re.compile(
+    r"""(?i)\b(api[_-]?key|access[_-]?key|secret[_-]?key|secret|token|password|passwd|pwd)\b"""
+    r"""(\s*["']?\s*[:=]\s*)(["']?)([A-Za-z0-9_\-./+=]{8,})\3""")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PRIVATE_IP_RE = re.compile(
+    r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
+
+_HOME_PATTERNS = [
+    # C:\Users\name   C:/Users/name
+    re.compile(r"(?i)\b[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"'`]+"),
+    # /c/Users/name（Git Bash / MSYS）
+    re.compile(r"(?i)(?<![\w.])/[a-z]/Users/[^/\s\"'`]+"),
+    # /home/name  /Users/name
+    re.compile(r"(?<![\w.])/(?:home|Users)/[^/\s\"'`]+"),
+    # /root
+    re.compile(r"(?<![\w.])/root(?=[/\s\"'`]|$)"),
+]
+
+_USERNAME_STOPLIST = {
+    "root", "user", "admin", "administrator", "guest", "runner", "ubuntu",
+    "windows", "win", "pc", "desktop", "laptop", "home", "test", "claude",
+}
+
+
+def _local_usernames() -> List[str]:
+    names = []
+    for key in ("USERNAME", "USER", "LOGNAME"):
+        v = os.environ.get(key)
+        if v:
+            names.append(v)
+    try:
+        import getpass
+        names.append(getpass.getuser())
+    except Exception:
+        pass
+    out = []
+    for n in names:
+        n = str(n).strip()
+        if len(n) >= 3 and n.lower() not in _USERNAME_STOPLIST and n not in out:
+            out.append(n)
+    return out
+
+
+def _redact_credentials(text: str) -> str:
+    text = _PRIVATE_KEY_RE.sub("[私钥已隐藏]", text)
+    text = _URL_AUTH_RE.sub(r"\1***:***@", text)
+    for pat in _TOKEN_RES:
+        text = pat.sub("***", text)
+    text = _BEARER_RE.sub("Bearer ***", text)
+    text = _ASSIGN_RE.sub(r"\1\2\3***\3", text)
+    text = _EMAIL_RE.sub("<email>", text)
+    text = _PRIVATE_IP_RE.sub("<private-ip>", text)
+    return text
+
+
+def _redact_paths(text: str) -> str:
+    for pat in _HOME_PATTERNS:
+        text = pat.sub("~", text)
+    for name in _local_usernames():
+        # 前后不能紧挨字母数字，避免误伤更长的单词
+        text = re.sub(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])",
+                      "~", text, flags=re.I)
+    return text
+
+
+def redact_text(text: str, mode: str = "strict") -> str:
+    """off：原样；safe：遮凭据/邮箱/内网 IP；strict：再把主目录用户名换成 ~。"""
+    if not text or mode == "off":
+        return text
+    text = _redact_credentials(text)
+    if mode == "strict":
+        text = _redact_paths(text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +900,7 @@ def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 30
 
 
 def summarize_one(cfg: Config, info: dict, label: str):
-    transcript = build_transcript(info)
+    transcript = redact_text(build_transcript(info), cfg.redact)
     text, usage = call_llm(cfg, summary_prompt(info, label, transcript))
     return text, usage, len(transcript)
 
@@ -920,7 +1014,8 @@ def obsidian_doc(info: dict, label: str, text: str, sid: str) -> str:
 def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Optional[str]:
     path = obsidian_path(cfg, info, sid)
     if path:
-        write_text_atomic(path, obsidian_doc(info, label, text, sid))
+        write_text_atomic(path,
+                          redact_text(obsidian_doc(info, label, text, sid), cfg.redact))
 
     month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
     if cfg.memory_dir:
@@ -933,7 +1028,7 @@ def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Opti
         except Exception:
             cur = f"# {month} 会话摘要\n\n> 自动生成。原文可在本地会话记录中检索。\n"
         cur = replace_block(cur, sid, monthly_block(month, info, label, text, sid))
-        write_text_atomic(mpath, cur)
+        write_text_atomic(mpath, redact_text(cur, cfg.redact))
         update_memory_index(cfg, month)
     return path
 
@@ -945,11 +1040,13 @@ def append_continuation(cfg: Config, info: dict, label: str, text: str,
         if os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 cur = fh.read()
-            write_text_atomic(path, cur.rstrip("\n") + "\n\n" + text.strip() + "\n")
+            write_text_atomic(path, redact_text(
+                cur.rstrip("\n") + "\n\n" + text.strip() + "\n", cfg.redact))
         else:
             # 文件丢失时，用旧摘要 + 续段重建
-            write_text_atomic(path, obsidian_doc(
-                info, label, prev_summary.rstrip() + "\n\n" + text, sid))
+            write_text_atomic(path, redact_text(obsidian_doc(
+                info, label, prev_summary.rstrip() + "\n\n" + text, sid),
+                cfg.redact))
 
     month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
     if cfg.memory_dir:
@@ -968,7 +1065,7 @@ def append_continuation(cfg: Config, info: dict, label: str, text: str,
                 cur, sid,
                 monthly_block(month, info, label,
                               prev_summary.rstrip() + "\n\n" + text, sid))
-        write_text_atomic(mpath, cur)
+        write_text_atomic(mpath, redact_text(cur, cfg.redact))
         update_memory_index(cfg, month)
     return path
 
@@ -1048,7 +1145,7 @@ def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
         "date": (info.get("_first_date") or info.get("start")),
         "project": label,
         "platform": info.get("kind"),
-        "title": title_of(info),
+        "title": redact_text(title_of(info), cfg.redact),
         "sid": sid,
         "file": path,
         "source": source,
@@ -1079,7 +1176,7 @@ def record_failure(cfg: Config, key: str, path: str, error: str,
     ent.update({
         "path": path,
         "kind": kind,
-        "error": str(error)[:500],
+        "error": redact_text(str(error), cfg.redact)[:500],
         "attempts": int(ent.get("attempts", 0)) + 1,
         "last": datetime.now().isoformat(timespec="seconds"),
     })
@@ -1291,7 +1388,7 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
                   f"out={usage.get('output_tokens')}")
 
         elif task.mode == "incremental":
-            delta = build_transcript(info)
+            delta = redact_text(build_transcript(info), cfg.redact)
             prompt = continuation_prompt(task.prev_summary or "", info, delta,
                                          _today(info))
             text, usage = call_llm(cfg, prompt)
@@ -1372,14 +1469,14 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
         date = (info.get("start") or "unknown").split(" ")[0]
         title = title_of(info).replace('"', "'")
         out = os.path.join(cfg.out_dir, f"{date}_{key[:8]}.md")
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("\n".join([
-                "---", f'title: "{title}"', f"project: {label}",
-                f"platform: {'claude-code' if kind == 'claude' else 'codex'}",
-                f'session: "{key}"', f"turns: {info.get('turns')}",
-                "---", "", f"# {title}", "", text, "",
-                "---", f"原文：`{path}`",
-            ]))
+        doc = "\n".join([
+            "---", f'title: "{title}"', f"project: {label}",
+            f"platform: {'claude-code' if kind == 'claude' else 'codex'}",
+            f'session: "{key}"', f"turns: {info.get('turns')}",
+            "---", "", f"# {title}", "", text, "",
+            "---", f"原文：`{path}`",
+        ])
+        write_text_atomic(out, redact_text(doc, cfg.redact))
         print(f"  {nchars} 字符 -> in={usage.get('input_tokens')} "
               f"out={usage.get('output_tokens')} -> {out}")
     return 0
@@ -1660,17 +1757,18 @@ def _run_export(cfg: Config) -> int:
             continue
         label = project_label(info, proj_dir, cfg.projects)
         sid = session_key(info, f)
-        fname = f"{sid[:8]}_{_safe_name(title_of(info))}.md"
+        title = redact_text(title_of(info), cfg.redact)
+        fname = f"{sid[:8]}_{_safe_name(title)}.md"
         if kind == "claude":
             out = os.path.join(cfg.out_dir, "Claude Code", _safe_name(label, 80), fname)
         else:
             out = os.path.join(cfg.out_dir, "Codex", fname)
-        write_plain_session(out, info, label)
+        write_plain_session(out, info, label, cfg.redact)
         idx[kind].setdefault(label, []).append((fname, info, out))
         total += 1
         index["sessions"][sid] = {
             "date": info.get("start"), "project": label, "platform": kind,
-            "title": title_of(info), "sid": sid, "file": out, "source": f,
+            "title": title, "sid": sid, "file": out, "source": f,
             "mode": "export", "updated": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -1686,7 +1784,8 @@ def _run_export(cfg: Config) -> int:
             lines.append(f"### {label}")
             for fname, info, _out in items:
                 d = (info.get("start") or "")[:10]
-                lines.append(f"- [[{os.path.splitext(fname)[0]}]] — {d} · {title_of(info)}")
+                lines.append(f"- [[{os.path.splitext(fname)[0]}]] — {d} · "
+                             f"{redact_text(title_of(info), cfg.redact)}")
             lines.append("")
 
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -1697,7 +1796,8 @@ def _run_export(cfg: Config) -> int:
     return 0
 
 
-def write_plain_session(path: str, info: dict, label: str) -> None:
+def write_plain_session(path: str, info: dict, label: str,
+                        redact_mode: str = "strict") -> None:
     title = title_of(info)
     md = ["---",
           f'title: "{title.replace(chr(34), chr(39))}"',
@@ -1730,9 +1830,7 @@ def write_plain_session(path: str, info: dict, label: str) -> None:
     if info.get("error"):
         md += ["", f"> 解析错误: {info['error']}"]
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(md))
+    write_text_atomic(path, redact_text("\n".join(md), redact_mode))
 
 
 # ---------------------------------------------------------------------------
@@ -1768,6 +1866,7 @@ def build_config(args) -> Config:
         min_delta_chars=args.min_delta_chars,
         force=args.force,
         verify=not args.no_verify,
+        redact=args.redact,
         verbose=args.verbose,
     )
 
@@ -1838,6 +1937,9 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="忽略状态，全部重跑")
     ap.add_argument("--no-verify", action="store_true",
                     help="不做事实校验（不把标识符与原文比对、不加 ⚠ 标记）")
+    ap.add_argument("--redact", choices=["off", "safe", "strict"], default="strict",
+                    help="脱敏：off 原样；safe 遮凭据/邮箱/内网 IP；"
+                         "strict 再把主目录用户名换成 ~（默认）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只列出计划和 token 估算，不调用模型、不写文件")
     ap.add_argument("--verbose", action="store_true", help="失败时打印完整堆栈")
