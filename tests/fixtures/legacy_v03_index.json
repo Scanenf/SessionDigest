@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "sessions": {
+    "sid-legacy": {
+      "date": null,
+      "project": "旧项目",
+      "platform": "claude",
+      "title": "旧摘要标题",
+      "sid": "sid-legacy",
+      "file": "${OBSIDIAN}",
+      "source": "${SRC}",
+      "mode": "full",
+      "updated": "2026-09-01T12:00:00"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "${SID}": {
+    "offset": ${SIZE},
+    "prefix_sha1": "${PREFIX}",
+    "sections": 2,
+    "date": "2026-09-01",
+    "first_date": "2026-09-01",
+    "first_title": "旧标题",
+    "source": "${SRC}",
+    "tokens": {"input_tokens": 10, "output_tokens": 5},
+    "done_at": "2026-09-01T12:00:00"
+  }
+}

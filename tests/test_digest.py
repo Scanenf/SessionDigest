@@ -2094,6 +2094,19 @@ def load_fixture_json(name, filename):
         return json.load(f)
 
 
+def legacy_text(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def legacy_json(name, **repl):
+    text = legacy_text(name)
+    for key, value in repl.items():
+        escaped = json.dumps(str(value))[1:-1]
+        text = text.replace("${" + key + "}", escaped)
+    return json.loads(text)
+
+
 def install_claude_fixture(cfg, name, limit=None):
     src = fixture_file(name, "session.jsonl")
     dst = os.path.join(cfg.claude_root, "shop", "session.jsonl")
@@ -2418,6 +2431,295 @@ class TestGoldenSemanticErrors(unittest.TestCase):
             failures = sd.load_failures(cfg)
             self.assertIn("原因", failures[key]["error"])
             self.assertIn("部署环境", failures[key]["error"])
+
+
+class TestLockContextManager(unittest.TestCase):
+    def test_context_manager_acquires_and_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "digest.lock")
+            with sd.ProcessLock(path) as lock:
+                self.assertIsNotNone(lock.fh)
+                other = sd.ProcessLock(path)
+                self.assertFalse(other.acquire())
+            self.assertTrue(sd.ProcessLock(path).acquire())
+
+    def test_context_manager_raises_when_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "digest.lock")
+            hold = sd.ProcessLock(path)
+            self.assertTrue(hold.acquire())
+            try:
+                with self.assertRaises(BlockingIOError):
+                    with sd.ProcessLock(path):
+                        pass
+            finally:
+                hold.release()
+
+
+class TestExportAndPreviewLocking(unittest.TestCase):
+    def _cfg(self, tmp):
+        cfg = make_cfg(tmp)
+        install_claude_fixture(cfg, "basic_claude")
+        return cfg
+
+    def test_export_dry_run_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            before = _snapshot(tmp)
+            buf = StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                rc = sd.cmd_export(cfg, dry=True)
+            self.assertEqual(rc, 0)
+            self.assertIn("dry-run", buf.getvalue())
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertFalse(os.path.exists(cfg.out_dir))
+            self.assertFalse(os.path.exists(cfg.lock_file))
+            self.assertFalse(os.path.exists(cfg.index_file))
+
+    def test_export_real_run_writes_index_v2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            buf = StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                rc = sd.cmd_export(cfg, dry=False)
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(os.path.join(cfg.out_dir,
+                                                        "README.md")))
+            index = sd.load_index(cfg)
+            self.assertEqual(index["version"], 2)
+            self.assertEqual(index["schema"], 2)
+            rec = next(iter(index["sessions"].values()))
+            self.assertEqual(rec["mode"], "export")
+            self.assertIsNone(rec["prompt_version"])
+            self.assertIn("file_ref", rec)
+
+    def test_preview_dry_run_does_not_lock_or_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            before = _snapshot(tmp)
+            buf = StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                rc = sd.cmd_preview(cfg, 1, dry=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertFalse(os.path.exists(cfg.lock_file))
+
+    def test_preview_refuses_when_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            hold = sd.ProcessLock(cfg.lock_file)
+            self.assertTrue(hold.acquire())
+            try:
+                buf = StringIO()
+                with redirect_stdout(buf), redirect_stderr(buf):
+                    rc = sd.cmd_preview(cfg, 1, dry=False)
+            finally:
+                hold.release()
+            self.assertEqual(rc, 1)
+            self.assertIn("另一个 SessionDigest 进程正在运行", buf.getvalue())
+
+
+class TestIndexV2AndValidation(unittest.TestCase):
+    def test_full_run_writes_summary_and_verify_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            install_claude_fixture(cfg, "basic_claude")
+            replay_obj = replay.ReplayLLM(
+                fixture_file("basic_claude", "llm_replay.json"))
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+            index = sd.load_index(cfg)
+            self.assertEqual(index["version"], 2)
+            self.assertEqual(index["schema"], 2)
+            rec = next(iter(index["sessions"].values()))
+            self.assertEqual(rec["prompt_version"], sd.PROMPT_VERSION)
+            self.assertGreaterEqual(rec["summary"]["sections"], 4)
+            self.assertGreater(rec["summary"]["chars"], 0)
+            self.assertTrue(rec["verify"]["enabled"])
+            self.assertLessEqual(len(rec["verify"]["flags"]), 50)
+
+    def test_validate_summary_detects_missing_sections(self):
+        text = "## 这一段在做什么\n只有一段。\n"
+        issues = sd.validate_summary(text)
+        self.assertIn("缺少章节：走过的路", issues)
+        self.assertIn("缺少章节：关键标识符", issues)
+        self.assertIn("缺少章节：还没完的事", issues)
+        self.assertEqual(sd.validate_summary(
+            "## 这一段在做什么\n\n## 走过的路\n\n"
+            "## 关键标识符\n\n## 还没完的事\n"), [])
+
+    def test_validate_continuation_accepts_continuation_headings(self):
+        text = ("## 续 · 2026-11-01\n\n### 新增了什么\n\n"
+                "### 修正了什么\n\n### 关键标识符\n\n### 还没完的事\n")
+        self.assertEqual(sd.validate_summary(text, continuation=True), [])
+        self.assertIn("缺少章节：这一段在做什么",
+                      sd.validate_summary(text))
+
+
+class TestLegacyCompatibility(unittest.TestCase):
+    def _session(self, cfg):
+        path = install_claude_fixture(cfg, "basic_claude")
+        info = sd.parse_session(path, "claude")
+        return path, info, sd.session_key(info, path)
+
+    def _write_json(self, path, data):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def test_legacy_v01_state_migrates_without_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path, _info, key = self._session(cfg)
+            state = legacy_json("legacy_v01_state.json", SID=key, SRC=path)
+            self._write_json(cfg.state_file, state)
+            state = sd.load_state(cfg)
+
+            tasks, notes = sd.plan_nightly(cfg, state)
+            self.assertEqual(tasks, [])
+            self.assertTrue(any("迁移旧状态" in n for n in notes))
+            self.assertEqual(state[key]["offset"], os.path.getsize(path))
+            self.assertEqual(state[key]["prefix_sha1"],
+                             sd.prefix_sha1(path, os.path.getsize(path)))
+
+    def test_legacy_v02_state_offsets_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path, _info, key = self._session(cfg)
+            size = os.path.getsize(path)
+            state = legacy_json(
+                "legacy_v02_state.json", SID=key, SRC=path, SIZE=size,
+                PREFIX=sd.prefix_sha1(path, size))
+            self._write_json(cfg.state_file, state)
+
+            sd.migrate_metadata(cfg)
+            entry = sd.load_state(cfg)[key]
+            self.assertEqual(entry["offset"], size)
+            self.assertEqual(entry["sections"], 2)
+            self.assertEqual(entry["prefix_sha1"],
+                             sd.prefix_sha1(path, size))
+            self.assertIn("source_ref", entry)
+
+    def test_legacy_v03_index_reads_and_migrates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src, _info, _key = self._session(cfg)
+            obs = os.path.join(cfg.obsidian_dir, "2026-09",
+                               "2026-09-01_sid-lega.md")
+            os.makedirs(os.path.dirname(obs), exist_ok=True)
+            with open(obs, "w", encoding="utf-8") as f:
+                f.write(legacy_text("legacy_obsidian_v01.md"))
+            index = legacy_json("legacy_v03_index.json", OBSIDIAN=obs, SRC=src)
+            self._write_json(cfg.index_file, index)
+
+            self.assertTrue(sd.migrate_metadata(cfg))
+            migrated = sd.load_index(cfg)
+            self.assertEqual(migrated["version"], 2)
+            self.assertEqual(migrated["schema"], 2)
+            rec = migrated["sessions"]["sid-legacy"]
+            self.assertEqual(rec["date"], "unknown")
+            self.assertIsInstance(rec["file_ref"], dict)
+            self.assertIsInstance(rec["source_ref"], dict)
+            self.assertEqual(sd.resolve_meta_path(cfg, rec, "file"), obs)
+            self.assertEqual(sd.resolve_meta_path(cfg, rec, "source"), src)
+
+            out = StringIO()
+            with redirect_stdout(out), redirect_stderr(StringIO()):
+                sd.cmd_context(cfg, 1, None)
+                sd.cmd_find(cfg, "摘要正文", 3, None)
+            self.assertIn("v0.1 格式的 Obsidian 摘要正文", out.getvalue())
+
+    def test_legacy_v03_failures_retry_uses_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src, _info, _key = self._session(cfg)
+            failures = legacy_json("legacy_v03_failures.json", SRC=src)
+            self._write_json(cfg.failures_file, failures)
+
+            sd.migrate_metadata(cfg)
+            entry = sd.load_failures(cfg)["sid-legacy-fail"]
+            self.assertEqual(sd.resolve_meta_path(cfg, entry, "path"), src)
+            self.assertEqual(entry["attempts"], 2)
+
+            with mock.patch.object(sd, "call_llm",
+                                   return_value=(FULL_SUMMARY,
+                                                 {"input_tokens": 1,
+                                                  "output_tokens": 1})):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    rc = sd._run_retry_failed(
+                        cfg, sd.load_failures(cfg))
+            self.assertEqual(rc, 0)
+            self.assertEqual(sd.load_failures(cfg), {})
+
+    def test_legacy_monthly_with_hr(self):
+        text = legacy_text("legacy_monthly_v02.md")
+        span = sd.find_monthly_block(text, "sid-legacy")
+        self.assertIsNotNone(span)
+        block = text[span[0]:span[1]]
+        self.assertIn("续写正文", block)
+        self.assertIn("---", block)
+        self.assertNotIn("另一份摘要", block)
+        self.assertIn("另一份摘要", text[span[1]:])
+
+        new_block = ("## 2026-09-01 · 旧项目\n\nsession: `sid-legacy`\n\n"
+                     "新正文。\n")
+        replaced = sd.replace_block(text, "sid-legacy", new_block)
+        self.assertIn("新正文", replaced)
+        self.assertIn("另一份摘要", replaced)
+        self.assertNotIn("旧摘要正文", replaced)
+
+        inserted = sd.insert_into_block(text, "sid-legacy", "追加正文。")
+        self.assertIn("追加正文", inserted)
+        self.assertIn("另一份摘要", inserted)
+
+    def test_legacy_obsidian_v01_reads_previous_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path = os.path.join(cfg.obsidian_dir, "2026-09",
+                                "2026-09-01_sid-lega.md")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(legacy_text("legacy_obsidian_v01.md"))
+            prev = sd.find_previous_summary(cfg, "sid-legacy")
+            self.assertIsNotNone(prev)
+            self.assertIn("v0.1 格式的 Obsidian 摘要正文", prev)
+            self.assertNotIn("title:", prev)
+
+    def test_migration_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src, _info, key = self._session(cfg)
+            obs = os.path.join(cfg.obsidian_dir, "2026-09",
+                               "2026-09-01_sid-lega.md")
+            os.makedirs(os.path.dirname(obs), exist_ok=True)
+            with open(obs, "w", encoding="utf-8") as f:
+                f.write(legacy_text("legacy_obsidian_v01.md"))
+            size = os.path.getsize(src)
+            self._write_json(cfg.state_file, legacy_json(
+                "legacy_v02_state.json", SID=key, SRC=src, SIZE=size,
+                PREFIX=sd.prefix_sha1(src, size)))
+            self._write_json(cfg.index_file, legacy_json(
+                "legacy_v03_index.json", OBSIDIAN=obs, SRC=src))
+            self._write_json(cfg.failures_file,
+                             legacy_json("legacy_v03_failures.json", SRC=src))
+
+            self.assertTrue(sd.migrate_metadata(cfg))
+            after_first = _snapshot(tmp)
+            self.assertFalse(sd.migrate_metadata(cfg))
+            self.assertEqual(_snapshot(tmp), after_first)
+
+    def test_migration_dry_run_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src, _info, key = self._session(cfg)
+            size = os.path.getsize(src)
+            self._write_json(cfg.state_file, legacy_json(
+                "legacy_v02_state.json", SID=key, SRC=src, SIZE=size,
+                PREFIX=sd.prefix_sha1(src, size)))
+            before = _snapshot(tmp)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                rc = sd.cmd_migrate(cfg, dry=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertFalse(os.path.exists(sd._ref_key_path(cfg)))
 
 
 if __name__ == "__main__":

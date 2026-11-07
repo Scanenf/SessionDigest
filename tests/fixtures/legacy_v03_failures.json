@@ -1,0 +1,9 @@
+{
+  "sid-legacy-fail": {
+    "attempts": 2,
+    "path": "${SRC}",
+    "kind": "claude",
+    "error": "模型端点超时",
+    "last": "2026-09-01T12:00:00"
+  }
+}

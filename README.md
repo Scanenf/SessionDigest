@@ -1,5 +1,7 @@
 # SessionDigest
 
+**deja-vu 找回过去，SessionDigest 留下结论。**
+
 把 **Claude Code** 和 **Codex** 的本地会话记录，蒸馏成结构化、人类可读的 Markdown 摘要。
 
 不装服务、不起守护进程、不建数据库。一个 Python 文件，跑完就退。
@@ -44,6 +46,8 @@
 
 - 不是检索工具。`--find` 只是在摘要里做关键词匹配；要搜原文或做语义检索，
   用 ripgrep、deja-vu 这类专门工具。
+- 不是 deja-vu 的替代品。两者方向相反：deja-vu 从过去会话里**找回**原始记录，
+  SessionDigest 把一场会话**压缩成结论**留给下一次；可以一起用，不能互相替代。
 - 不是自动注入。它不会在开场把内容塞进上下文——由你决定什么时候读。
 - 不是云端服务。所有文件都在本地。
 
@@ -284,6 +288,44 @@ python session_digest.py --rebind-root r2_旧id --claude-root /新位置
 `h2_` 组件**。请把 `digest.key` 和 `roots.json` 与 state 一起备份，且不要提交到
 仓库（`.gitignore` 已排除）。
 
+## 索引 v2
+
+`index.json` 从 v0.5.0 起是 schema 2。除了原有的 `sid` / `date` / `project` /
+`title` / `mode` / `updated`，每条会话还写入：
+
+```json
+{
+  "version": 2,
+  "schema": 2,
+  "sessions": {
+    "<sid>": {
+      "date": "2026-11-08",
+      "project": "shop",
+      "title": "给导出加 RFC 5987 文件名",
+      "file_ref": {"root": "obsidian", "h2": "..."},
+      "source_ref": {"root": "claude", "h2": "..."},
+      "mode": "full",
+      "prompt_version": 2,
+      "summary": {"sections": 4, "chars": 1832, "warning_count": 1},
+      "verify": {
+        "enabled": true,
+        "flags": [{"text": "`src/export.py`", "mark": "⚠"}]
+      },
+      "updated": "2026-11-08T03:07:00"
+    }
+  }
+}
+```
+
+- `prompt_version` 记录这份摘要由哪一版提示词生成，便于以后筛选旧摘要。
+- `summary` 只是长度和标记计数，不保存正文；正文仍在 Obsidian 或月度文件里。
+- `verify.flags` 最多保留 50 条，避免索引无限增长。
+- 路径字段一律是相对的 `file_ref` / `source_ref`（见「路径引用与根目录移动」），
+  不写明文绝对路径。
+
+v1 索引在第一次运行 `--migrate` 或写操作时自动升级：先由旧绝对路径生成 ref，
+再脱敏显示字段；`date` 为 `null` 的旧记录会写成 `"unknown"`。
+
 ## 按问题找历史
 
 `--context` 是“最近 N 场”，`--find` 才是“和这个问题有关的”：
@@ -432,9 +474,10 @@ python session_digest.py --retry-failed             # 逐个重试
 
 ## 并发与锁
 
-`--nightly`、`--export` 和 `--retry-failed` 启动时会先拿一个进程锁（默认是
-state 文件旁的 `state.json.lock`）。定时任务和手动运行撞上时，第二个进程会
-直接退出并提示，不会两个进程同时改 state、索引和摘要文件。
+`--nightly`、`--export`、`--preview`（非 dry-run）和 `--retry-failed` 启动时
+会先拿一个进程锁（默认是 state 文件旁的 `state.json.lock`）。定时任务和手动
+运行撞上时，第二个进程会直接退出并提示，不会两个进程同时改 state、索引和
+摘要文件。
 
 锁用的是操作系统文件锁：进程正常退出或崩溃，系统都会自动释放，不会留下
 需要手工删除的死锁。`--dry-run` 只读不加锁。
@@ -491,6 +534,29 @@ digest-output/                    # --export / --llm
 └── MEMORY.md                     # 自动插入一行索引
 ```
 
+## 从 v0.4 升级
+
+代码和 state 可以直接用，第一次运行会做三件事：
+
+1. **索引升到 v2**：`version` / `schema` 写 2，`file` / `source` 换成
+   `file_ref` / `source_ref`，`date: null` 改成 `"unknown"`。迁移是幂等的，
+   第二次运行不再写文件。
+2. **旧 state 补脱敏字段**：`first_title` / `source` 脱敏，偏移量和 `sections`
+   不动，不会重跑历史。
+3. **失败队列补 `path_ref`**：重试优先用 ref，找不到时回退到旧绝对路径。
+
+升级前建议先跑一遍 `--migrate --dry-run`，它会列出要迁移多少条记录，不写任何文件。
+`--dry-run` 全程不加锁、不生成 `digest.key`、不改 state/index/failures。
+
+**无法自动恢复的旧 ref**：v0.4 之前写入的绝对路径如果所在目录已经被删除或移动，
+程序生成不出对应的 ref，会标记为 `legacy_outside_root` 并继续保留旧路径回退。
+需要你手动做的是：把文件移回已知根目录，或者用 `--repair-ref` 指定新位置；
+文件已经不存在时，只能把该条索引/失败记录删掉。
+
+`digest.key` 丢失时，历史 ref 里的 HMAC 部分无法重算，旧引用会解析失败
+（表中 `key_missing`）。把 `digest.key`、`roots.json` 和 state 一起备份；
+它们不进入 Git。
+
 ## 从 v0.1 升级
 
 v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏移量，**不重跑历史**。
@@ -502,7 +568,7 @@ v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏�
 python -m unittest discover -s tests -v
 ```
 
-132 个用例，覆盖两个解析器、命令事件关联、严格 argv 比对与证据等级、
+149 个用例，覆盖两个解析器、命令事件关联、严格 argv 比对与证据等级、
 增量读取、前缀哈希、事实校验（含 `--no-verify`）、脱敏（密钥/邮箱/内网 IP/
 主目录路径、发送前与落盘前各一道）、v2 路径引用与旧数据迁移、读取与异常输出的
 二次脱敏、月度块替换、规划判定、索引、失败队列、`--context`/`--find` 过滤，
@@ -510,8 +576,10 @@ python -m unittest discover -s tests -v
 追加、偏移落半行、合并丢失结论被拒、正文 `---`/`##` 不截断月度块）、
 Golden Dataset（管线契约、录制快照、事实遗漏/编造/待办误标完成/推测当事实/
 旧决定未更新/跨项目事实/原因丢失/合并丢原因）、
-进程锁（含跨进程争抢）、原子写入中断、HTTP 错误、超时、非 JSON 响应、
-模型返回被截断等异常恢复场景。
+进程锁（含跨进程争抢与上下文管理器）、原子写入中断、HTTP 错误、超时、
+非 JSON 响应、模型返回被截断等异常恢复场景；v0.1–v0.4 旧 state/index/
+failures/月度块/Obsidian frontmatter 的读取与迁移、迁移幂等、所有 dry-run
+前后目录快照完全一致、索引 v2 字段与 `validate_summary` 章节校验。
 另有一组哨兵扫描测试，把 state/index/failures/摘要/导出/终端/异常栈/临时文件/
 未跟踪文件等 17 类产物集中检查，确认已知哨兵没有漏出。接口测试用本地起的小
 HTTP 服务，不访问外网。

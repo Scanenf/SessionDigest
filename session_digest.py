@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 # 提示词版本：摘要结构或约束变化时递增；Golden 回放文件按它校验。
 PROMPT_VERSION = 2
 
@@ -192,6 +192,8 @@ class ProcessLock:
             fh.close()
 
     def __enter__(self):
+        if not self.acquire():
+            raise BlockingIOError(f"锁已被占用：{self.path}")
         return self
 
     def __exit__(self, *exc):
@@ -1506,6 +1508,27 @@ def checked_summary(cfg: "Config", text: str, info: dict,
     return carry_forward_warnings(verify_summary(text, info), prev_summary, info)
 
 
+_SUMMARY_REQUIRED = ("这一段在做什么", "走过的路", "关键标识符", "还没完的事")
+_CONTINUATION_REQUIRED = ("新增了什么", "修正了什么", "关键标识符", "还没完的事")
+
+
+def validate_summary(text: str, continuation: bool = False) -> List[str]:
+    """检查摘要的章节结构；返回缺失项，空列表表示结构完整。
+
+    这是结构检查，不判断内容真假；缺失章节只警告，不拒绝写入，
+    避免模型偶尔漏标题时整段摘要被丢弃。
+    """
+    issues: List[str] = []
+    if not str(text or "").strip():
+        return ["摘要为空"]
+    names = [name for name, _lines in _summary_sections(text)]
+    required = _CONTINUATION_REQUIRED if continuation else _SUMMARY_REQUIRED
+    for heading in required:
+        if not any(heading in name for name in names):
+            issues.append("缺少章节：" + heading)
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # 摘要输入与模型调用
 # ---------------------------------------------------------------------------
@@ -2191,6 +2214,24 @@ def merge_loss_check(old_facts: List[dict], merged: str) -> List[str]:
 # 索引与失败队列
 # ---------------------------------------------------------------------------
 
+_MARKER_RE = re.compile(r"`([^`]+)`\s*(⚠≠|⚠\?|⚠)")
+
+
+def summary_meta(text: str) -> dict:
+    text = str(text or "")
+    return {
+        "sections": len(_summary_sections(text)),
+        "chars": len(text),
+        "warning_count": len(_MARKER_RE.findall(text)),
+    }
+
+
+def verify_meta(cfg: "Config", text: str) -> dict:
+    flags = [{"text": frag[:200], "mark": mark}
+             for frag, mark in _MARKER_RE.findall(str(text or ""))][:50]
+    return {"enabled": bool(cfg.verify), "flags": flags}
+
+
 def load_index(cfg: Config) -> dict:
     try:
         with open(cfg.index_file, encoding="utf-8") as f:
@@ -2199,10 +2240,12 @@ def load_index(cfg: Config) -> dict:
             return data
     except Exception:
         pass
-    return {"version": 1, "sessions": {}}
+    return {"version": 2, "schema": 2, "sessions": {}}
 
 
 def save_index(cfg: Config, index: dict) -> None:
+    index["version"] = 2
+    index["schema"] = 2
     write_text_atomic(cfg.index_file,
                       json.dumps(index, ensure_ascii=False, indent=1))
 
@@ -2229,6 +2272,8 @@ def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
             sid=sid),
         "mode": mode,
         "prompt_version": PROMPT_VERSION,
+        "summary": summary_meta(text),
+        "verify": verify_meta(cfg, text),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     save_index(cfg, index)
@@ -2382,12 +2427,19 @@ def migrate_index(cfg: Config, index: dict,
     sessions = index.get("sessions")
     if not isinstance(sessions, dict):
         return False
+    if index.get("version") != 2 or index.get("schema") != 2:
+        index["version"] = 2
+        index["schema"] = 2
+        changed = True
     key_bytes = _load_ref_key(cfg, create=False)
     for sid, rec in sessions.items():
         if not isinstance(rec, dict):
             continue
         if not rec.get("sid"):
             rec["sid"] = str(sid)
+            changed = True
+        if rec.get("date") is None:
+            rec["date"] = "unknown"
             changed = True
         for key in ("file", "source"):
             raw = rec.get(key)
@@ -2637,6 +2689,9 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
         if task.mode == "full":
             text, usage, nchars = summarize_one(cfg, info, task.label)
             text = checked_summary(cfg, text, info)
+            issues = validate_summary(text)
+            if issues:
+                print("  结构警告：" + "；".join(issues), file=sys.stderr)
             write_full(cfg, info, task.label, text, sid)
             sections = 0
             # state 里的结论代理同样要脱敏，不能绕过落盘前的隐私处理
@@ -2650,6 +2705,9 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             prompt = continuation_prompt(prev, info, delta, _today(info))
             text, usage = call_llm(cfg, prompt)
             text = checked_summary(cfg, text, info, prev)
+            issues = validate_summary(text, continuation=True)
+            if issues:
+                print("  结构警告：" + "；".join(issues), file=sys.stderr)
             # 偏移量用调用前确定的边界：调用期间追加的行留给下一轮
             append_continuation(cfg, info, task.label, text, sid, prev,
                                 task.new_offset)
@@ -2666,6 +2724,9 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             prev = redact_text(task.prev_summary or "", cfg.redact)
             text, usage = call_llm(cfg, merge_prompt(prev))
             text = checked_summary(cfg, text, info)
+            issues = validate_summary(text)
+            if issues:
+                print("  结构警告：" + "；".join(issues), file=sys.stderr)
             old_facts = prev_entry.get("digest_facts") \
                 or extract_conclusions(prev)
             safe_text = redact_text(text, cfg.redact)
@@ -2745,35 +2806,41 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
                   f"{redact_text(path, cfg.redact)}")
         return 0
 
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    for i, (info, label, kind, path, key) in enumerate(todo, 1):
-        print(f"[{i}/{len(todo)}] {redact_text(label, cfg.redact)} | "
-              f"{info.get('start')} | {info.get('turns')} 条消息")
-        try:
-            text, usage, nchars = summarize_one(cfg, info, label)
-        except Exception as e:
-            print("  失败:", safe_error(e, cfg.redact), file=sys.stderr)
-            if cfg.verbose:
-                import traceback
-                print(redact_text(traceback.format_exc(), cfg.redact),
-                      file=sys.stderr)
-            continue
-        text = checked_summary(cfg, text, info)
-        date = (info.get("start") or "unknown").split(" ")[0]
-        title = title_of(info).replace('"', "'")
-        out = os.path.join(cfg.out_dir, f"{date}_{key[:8]}.md")
-        doc = "\n".join([
-            "---", f'title: "{title}"', f"project: {label}",
-            f"platform: {'claude-code' if kind == 'claude' else 'codex'}",
-            f'session: "{key}"', f"turns: {info.get('turns')}",
-            "---", "", f"# {title}", "", text, "",
-            "---", f"原文：`{path}`",
-        ])
-        write_text_atomic(out, redact_text(doc, cfg.redact))
-        print(f"  {nchars} 字符 -> in={usage.get('input_tokens')} "
-              f"out={usage.get('output_tokens')} -> "
-              f"{redact_text(out, cfg.redact)}")
-    return 0
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        os.makedirs(cfg.out_dir, exist_ok=True)
+        for i, (info, label, kind, path, key) in enumerate(todo, 1):
+            print(f"[{i}/{len(todo)}] {redact_text(label, cfg.redact)} | "
+                  f"{info.get('start')} | {info.get('turns')} 条消息")
+            try:
+                text, usage, nchars = summarize_one(cfg, info, label)
+            except Exception as e:
+                print("  失败:", safe_error(e, cfg.redact), file=sys.stderr)
+                if cfg.verbose:
+                    import traceback
+                    print(redact_text(traceback.format_exc(), cfg.redact),
+                          file=sys.stderr)
+                continue
+            text = checked_summary(cfg, text, info)
+            date = (info.get("start") or "unknown").split(" ")[0]
+            title = title_of(info).replace('"', "'")
+            out = os.path.join(cfg.out_dir, f"{date}_{key[:8]}.md")
+            doc = "\n".join([
+                "---", f'title: "{title}"', f"project: {label}",
+                f"platform: {'claude-code' if kind == 'claude' else 'codex'}",
+                f'session: "{key}"', f"turns: {info.get('turns')}",
+                "---", "", f"# {title}", "", text, "",
+                "---", f"原文：`{path}`",
+            ])
+            write_text_atomic(out, redact_text(doc, cfg.redact))
+            print(f"  {nchars} 字符 -> in={usage.get('input_tokens')} "
+                  f"out={usage.get('output_tokens')} -> "
+                  f"{redact_text(out, cfg.redact)}")
+        return 0
+    finally:
+        lock.release()
 
 
 def cmd_nightly(cfg: Config, dry: bool) -> int:
@@ -3134,18 +3201,21 @@ def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
     return 1 if failed else 0
 
 
-def cmd_export(cfg: Config) -> int:
+def cmd_export(cfg: Config, dry: bool = False) -> int:
+    if dry:
+        return _run_export(cfg, dry=True)
     lock = lock_or_report(cfg)
     if lock is None:
         return 1
     try:
-        return _run_export(cfg)
+        return _run_export(cfg, dry=False)
     finally:
         lock.release()
 
 
-def _run_export(cfg: Config) -> int:
-    migrate_metadata(cfg)
+def _run_export(cfg: Config, dry: bool = False) -> int:
+    if not dry:
+        migrate_metadata(cfg)
     idx = {"claude": OrderedDict(), "codex": OrderedDict()}
     total = 0
     index = load_index(cfg)
@@ -3163,19 +3233,28 @@ def _run_export(cfg: Config) -> int:
             out = os.path.join(cfg.out_dir, "Claude Code", _safe_name(label, 80), fname)
         else:
             out = os.path.join(cfg.out_dir, "Codex", fname)
-        write_plain_session(out, info, label, cfg.redact)
         idx[kind].setdefault(label, []).append((fname, info, out))
         total += 1
-        index["sessions"][sid] = {
-            "date": info.get("start"), "project": label, "platform": kind,
-            "title": title, "sid": sid,
-            "file": redact_text(out, cfg.redact),
-            "source": redact_text(f, cfg.redact),
-            "file_ref": make_path_ref(cfg, out, "out"),
-            "source_ref": make_path_ref(cfg, f, kind),
-            "mode": "export",
-            "updated": datetime.now().isoformat(timespec="seconds"),
-        }
+        if not dry:
+            write_plain_session(out, info, label, cfg.redact)
+            index["sessions"][sid] = {
+                "date": info.get("start"), "project": label, "platform": kind,
+                "title": title, "sid": sid,
+                "file": redact_text(out, cfg.redact),
+                "source": redact_text(f, cfg.redact),
+                "file_ref": make_path_ref(cfg, out, "out"),
+                "source_ref": make_path_ref(cfg, f, kind),
+                "mode": "export",
+                "prompt_version": None,
+                "summary": None,
+                "verify": None,
+                "updated": datetime.now().isoformat(timespec="seconds"),
+            }
+
+    if dry:
+        print(f"[dry-run] 将导出 {total} 场会话 -> "
+              f"{redact_text(cfg.out_dir, cfg.redact)}（不写文件）")
+        return 0
 
     lines = ["---", "title: 会话记忆库", "tags: [index]", "---", "",
              "# 会话记忆库", "",
@@ -3675,7 +3754,7 @@ def main(argv=None) -> int:
         return cmd_repair_ref(cfg, args.repair_ref, args.source,
                               args.file_path, args.dry_run)
     if args.export:
-        return cmd_export(cfg)
+        return cmd_export(cfg, args.dry_run)
     if args.llm:
         return cmd_preview(cfg, args.llm, args.dry_run)
     if args.context:
