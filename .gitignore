@@ -18,6 +18,9 @@ index.json
 index.json.tmp
 failures.json
 failures.json.tmp
+digest.key
+roots.json
+roots.json.tmp
 
 # 个人配置
 projects.json

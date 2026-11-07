@@ -700,13 +700,20 @@ class TestPrivacyMetadata(unittest.TestCase):
         sd.update_index(cfg, info, "测试用户项目", "body", "sid-meta",
                         src, "full")
         rec = sd.load_index(cfg)["sessions"]["sid-meta"]
-        self.assertEqual(rec["source_ref"], {"root": "claude", "rel": "proj/a.jsonl"})
+        source_ref = rec["source_ref"]
+        self.assertEqual(source_ref["v"], 2)
+        self.assertEqual(source_ref["root"], "claude")
+        self.assertEqual([p.get("n") for p in source_ref["parts"]],
+                         ["proj", "a.jsonl"])
+        self.assertNotIn("rel", source_ref)
         self.assertEqual(rec["file_ref"]["root"], "obsidian")
         self.assertNotIn("测试用户", json.dumps(rec, ensure_ascii=False))
 
         sd.record_failure(cfg, "sid-meta", src, "boom 测试用户", "claude")
         fail = sd.load_failures(cfg)["sid-meta"]
-        self.assertEqual(fail["path_ref"], {"root": "claude", "rel": "proj/a.jsonl"})
+        self.assertEqual(fail["path_ref"]["v"], 2)
+        self.assertEqual(fail["path_ref"]["root"], "claude")
+        self.assertNotIn("rel", fail["path_ref"])
         self.assertNotIn("测试用户", json.dumps(fail, ensure_ascii=False))
 
     def test_execute_task_scrubs_state_and_index(self):
@@ -984,6 +991,484 @@ class TestPrivacyScanCoverage(unittest.TestCase):
 
         self.assertEqual(PrivacyScan.REQUIRED - scan.scanned, set())
         self.assertEqual(scan.leaks, [])
+
+
+def _write_session(path, sid, text="hello"):
+    write_jsonl(path, [{
+        "type": "user", "timestamp": "2026-11-01T10:00:00Z",
+        "sessionId": sid, "cwd": "C:/work/shop",
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    }])
+
+
+def _cfg_with_root(tmp, claude_root=None, codex_root=None):
+    cfg = make_cfg(tmp)
+    if claude_root:
+        cfg.claude_root = claude_root
+    if codex_root:
+        cfg.codex_root = codex_root
+    return cfg
+
+
+class TestRefStability(unittest.TestCase):
+    """v0.5.0 ref v2：根绑定、掩码目录、恢复线索与明确失败状态。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_cfg(self.tmp)
+
+    def _ref(self, path, sid, preferred="claude"):
+        sd.ensure_ref_key(self.cfg)
+        return sd.make_path_ref(self.cfg, path, preferred, sid=sid)
+
+    def test_normal_root_reads(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-normal")
+        ref = self._ref(src, "sid-normal")
+        self.assertEqual(ref["v"], 2)
+        self.assertEqual(ref["root"], "claude")
+        self.assertNotIn(self.tmp, json.dumps(ref, ensure_ascii=False))
+        res = sd.resolve_ref(self.cfg, ref)
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.path, src)
+
+    def test_root_move_needs_rebind_and_historical_ref_is_unchanged(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-move")
+        ref = self._ref(src, "sid-move")
+        frozen = json.loads(json.dumps(ref))
+
+        moved = os.path.join(self.tmp, "claude-moved")
+        shutil.move(self.cfg.claude_root, moved)
+        cfg2 = _cfg_with_root(self.tmp, claude_root=moved)
+        res = sd.resolve_ref(cfg2, ref)
+        self.assertEqual(res.status, "unbound_root")
+        self.assertIsNone(res.path)
+
+        rc = sd.cmd_rebind_root(cfg2, ref["root_id"], "claude", False, False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ref, frozen)
+        res = sd.resolve_ref(cfg2, ref)
+        self.assertEqual(res.status, "ok")
+        self.assertTrue(os.path.samefile(res.path, src.replace(
+            self.cfg.claude_root, moved)))
+
+        # 再整体移动一次：旧 ref -> 第一次的新 id -> 第二次的新 id
+        moved2 = os.path.join(self.tmp, "claude-moved-2")
+        shutil.move(moved, moved2)
+        cfg3 = _cfg_with_root(self.tmp, claude_root=moved2)
+        self.assertEqual(sd.resolve_ref(cfg3, ref).status, "unbound_root")
+        self.assertEqual(sd.cmd_rebind_root(
+            cfg3, ref["root_id"], "claude", False, False), 0)
+        self.assertEqual(sd.resolve_ref(cfg3, ref).status, "ok")
+
+    def test_changed_root_without_rebind_reports_unbound(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-unbound")
+        ref = self._ref(src, "sid-unbound")
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(other)
+        cfg2 = _cfg_with_root(self.tmp, claude_root=other)
+        res = sd.resolve_ref(cfg2, ref)
+        self.assertEqual(res.status, "unbound_root")
+        self.assertEqual(res.path, None)
+
+    def test_subdir_move_recovers_or_reports_ambiguity(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "sub", "a.jsonl")
+        _write_session(src, "sid-sub")
+        ref = self._ref(src, "sid-sub")
+        dest = os.path.join(self.cfg.claude_root, "other", "a.jsonl")
+        os.makedirs(os.path.dirname(dest))
+        shutil.move(src, dest)
+        res = sd.resolve_ref(self.cfg, ref)
+        self.assertEqual(res.status, "recovered")
+        self.assertTrue(res.recovered)
+        self.assertEqual(res.path, dest)
+
+        duplicate = os.path.join(self.cfg.claude_root, "other2", "a.jsonl")
+        os.makedirs(os.path.dirname(duplicate))
+        shutil.copyfile(dest, duplicate)
+        res = sd.resolve_ref(self.cfg, ref)
+        self.assertEqual(res.status, "ambiguous")
+        self.assertIsNone(res.path)
+
+    def test_renamed_source_recovers_by_sid(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-rename")
+        ref = self._ref(src, "sid-rename")
+        dest = os.path.join(self.cfg.claude_root, "proj", "renamed.jsonl")
+        os.rename(src, dest)
+        res = sd.resolve_ref(self.cfg, ref)
+        self.assertEqual(res.status, "recovered")
+        self.assertEqual(res.path, dest)
+
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write('{"type": "user", "message": "different"}\n')
+        self.assertEqual(sd.resolve_ref(self.cfg, ref).status, "missing")
+
+    def test_deleted_source_is_missing_not_empty(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-deleted")
+        ref = self._ref(src, "sid-deleted")
+        os.remove(src)
+        res = sd.resolve_ref(self.cfg, ref)
+        self.assertEqual(res.status, "missing")
+        self.assertIsNone(res.path)
+
+    def test_same_filename_in_two_projects_never_crosses(self):
+        p1 = os.path.join(self.cfg.claude_root, "proj1", "a.jsonl")
+        p2 = os.path.join(self.cfg.claude_root, "proj2", "a.jsonl")
+        _write_session(p1, "sid-one")
+        _write_session(p2, "sid-two")
+        r1 = self._ref(p1, "sid-one")
+        r2 = self._ref(p2, "sid-two")
+        self.assertEqual(sd.resolve_ref(self.cfg, r1).path, p1)
+        self.assertEqual(sd.resolve_ref(self.cfg, r2).path, p2)
+
+        # 两个原始路径都移走，恢复必须按 sid 选对，不能按文件名
+        d1 = os.path.join(self.cfg.claude_root, "moved1", "a.jsonl")
+        d2 = os.path.join(self.cfg.claude_root, "moved2", "a.jsonl")
+        for d in (d1, d2):
+            os.makedirs(os.path.dirname(d))
+        shutil.move(p1, d1)
+        shutil.move(p2, d2)
+        self.assertEqual(sd.resolve_ref(self.cfg, r1).path, d1)
+        self.assertEqual(sd.resolve_ref(self.cfg, r2).path, d2)
+
+    def test_legacy_path_outside_known_roots_is_reported_not_guessed(self):
+        outside = os.path.join(self.tmp, "elsewhere", "a.jsonl")
+        _write_session(outside, "sid-outside")
+        self.assertEqual(
+            sd.ref_migration_status(self.cfg, None, outside),
+            "legacy_outside_root")
+        sd.save_index(self.cfg, {"version": 1, "sessions": {
+            "sid-outside": {"sid": "sid-outside", "source": outside}}})
+        before = _snapshot(self.tmp)
+        buf = StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            rc = sd.cmd_migrate(self.cfg, dry=False)
+        self.assertEqual(rc, 1)
+        rec = sd.load_index(self.cfg)["sessions"]["sid-outside"]
+        self.assertNotIn("source_ref", rec)
+        # 不认识的旧路径不会被强行写成错误 ref
+        self.assertIn("不在任何已知根目录内", buf.getvalue())
+        self.assertNotEqual(_snapshot(self.tmp), before)  # 只多了密钥/锁
+
+    def test_ambiguous_ref_is_not_downgraded_by_stale_legacy_path(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-amb-legacy")
+        ref = self._ref(src, "sid-amb-legacy")
+        for sub in ("other", "other2"):
+            dup = os.path.join(self.cfg.claude_root, sub, "a.jsonl")
+            os.makedirs(os.path.dirname(dup))
+            shutil.copyfile(src, dup)
+        os.remove(src)
+        rec = {
+            "sid": "sid-amb-legacy",
+            "source_ref": ref,
+            # 旧字段是已不存在的绝对路径：不能把 ambiguous 降级成 missing
+            "source": os.path.join(self.tmp, "gone", "a.jsonl"),
+        }
+        res = sd.resolve_meta(self.cfg, rec, "source")
+        self.assertEqual(res.status, "ambiguous")
+        self.assertIsNone(res.path)
+        self.assertGreaterEqual(len(res.candidates), 2)
+
+    def test_legacy_redacted_path_does_not_fall_back(self):
+        rec = {"sid": "sid-redacted", "file": "~/vault/2026-11/x.md"}
+        res = sd.resolve_meta(self.cfg, rec, "file")
+        self.assertEqual(res.status, "legacy_redacted")
+        self.assertIsNone(res.path)
+        text, res2 = sd.summary_result(self.cfg, rec)
+        self.assertEqual(text, "")
+        self.assertEqual(res2.status, "legacy_redacted")
+
+    def test_v1_metadata_migrates_to_v2(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-migrate")
+        obs = os.path.join(self.cfg.obsidian_dir, "2026-11", "x.md")
+        os.makedirs(os.path.dirname(obs))
+        with open(obs, "w", encoding="utf-8") as f:
+            f.write('---\nsession: "sid-migrate"\n---\n\nbody\n')
+        index = {"version": 1, "sessions": {"sid-migrate": {
+            "sid": "sid-migrate", "file": obs, "source": src,
+            "file_ref": {"root": "obsidian", "rel": "2026-11/x.md"},
+            "source_ref": {"root": "claude", "rel": "proj/a.jsonl"}}}}
+        state = {"sid-migrate": {"offset": 1, "source": src,
+                                 "source_ref": {"root": "claude",
+                                                "rel": "proj/a.jsonl"}}}
+        failures = {"sid-migrate": {"attempts": 1, "path": src,
+                                    "path_ref": {"root": "claude",
+                                                 "rel": "proj/a.jsonl"}}}
+        for path, data in ((self.cfg.index_file, index),
+                           (self.cfg.state_file, state),
+                           (self.cfg.failures_file, failures)):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+
+        self.assertTrue(sd.migrate_metadata(self.cfg))
+        rec = sd.load_index(self.cfg)["sessions"]["sid-migrate"]
+        for ref in (rec["file_ref"], rec["source_ref"]):
+            self.assertEqual(ref["v"], 2)
+            self.assertIn("root_id", ref)
+        self.assertNotIn(self.tmp, json.dumps(rec, ensure_ascii=False))
+        self.assertEqual(sd.resolve_meta(self.cfg, rec, "file").path, obs)
+        self.assertEqual(sd.resolve_meta(
+            self.cfg, sd.load_state(self.cfg)["sid-migrate"], "source").path,
+            src)
+        self.assertFalse(sd.migrate_metadata(self.cfg))
+
+    def test_interrupted_migration_rerun_has_no_duplicates(self):
+        src = os.path.join(self.cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-crash")
+        index = {"version": 1, "sessions": {"sid-crash": {
+            "sid": "sid-crash", "source": src,
+            "source_ref": {"root": "claude", "rel": "proj/a.jsonl"}}}}
+        state = {"sid-crash": {"offset": 1, "source": src,
+                               "source_ref": {"root": "claude",
+                                              "rel": "proj/a.jsonl"}}}
+        with open(self.cfg.index_file, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False)
+        with open(self.cfg.state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+
+        real_save = sd.save_index
+        calls = {"n": 0}
+
+        def flaky(cfg, data):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError("simulated interruption")
+            return real_save(cfg, data)
+
+        with mock.patch.object(sd, "save_index", side_effect=flaky):
+            with self.assertRaises(OSError):
+                sd.migrate_metadata(self.cfg)
+
+        # state 已迁移，index 还是 v1；重跑必须补齐且不产生重复
+        self.assertEqual(sd.load_state(self.cfg)["sid-crash"]
+                         ["source_ref"]["v"], 2)
+        self.assertEqual(sd.load_index(self.cfg)["sessions"]["sid-crash"]
+                         ["source_ref"]["rel"], "proj/a.jsonl")
+        self.assertTrue(sd.migrate_metadata(self.cfg))
+        rec = sd.load_index(self.cfg)["sessions"]["sid-crash"]
+        self.assertEqual(rec["source_ref"]["v"], 2)
+        self.assertEqual(set(sd.load_index(self.cfg)["sessions"]),
+                         {"sid-crash"})
+        self.assertEqual(set(sd.load_state(self.cfg)), {"sid-crash"})
+        self.assertFalse(sd.migrate_metadata(self.cfg))
+
+
+class TestRefPrivacy(unittest.TestCase):
+    def test_username_directory_is_hashed_and_still_resolves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            with mock.patch.object(sd, "_local_usernames",
+                                   return_value=["testuser"]):
+                src = os.path.join(cfg.claude_root,
+                                   "c--Users-testuser-shop", "a.jsonl")
+                _write_session(src, "sid-masked")
+                sd.ensure_ref_key(cfg)
+                ref = sd.make_path_ref(cfg, src, "claude", sid="sid-masked")
+                self.assertEqual([p.get("n") for p in ref["parts"]],
+                                 [None, "a.jsonl"])
+                self.assertIn("h", ref["parts"][0])
+                blob = json.dumps(ref, ensure_ascii=False)
+                self.assertNotIn("testuser", blob)
+                self.assertNotIn("c--Users", blob)
+                res = sd.resolve_ref(cfg, ref)
+                self.assertEqual(res.status, "ok")
+                self.assertEqual(res.path, src)
+
+                # 同一目录名 token 稳定，不同目录名 token 不同
+                token = sd._part_token(sd._load_ref_key(cfg), "c--Users-testuser-shop")
+                self.assertEqual(token, ref["parts"][0]["h"])
+                self.assertNotEqual(
+                    token, sd._part_token(sd._load_ref_key(cfg), "other-shop"))
+                self.assertNotIn("testuser", token)
+
+    def test_key_file_is_written_verbatim_in_binary_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            # 含 \n 的密钥：Windows 文本模式会把 \n 扩成 \r\n，必须按二进制写
+            key = b"\n" * 32
+            with mock.patch.object(sd.os, "urandom", return_value=key):
+                self.assertEqual(sd.ensure_ref_key(cfg), key)
+            with open(sd._ref_key_path(cfg), "rb") as f:
+                self.assertEqual(f.read(), key)
+            self.assertEqual(sd._load_ref_key(cfg), key)
+
+    def test_missing_key_breaks_v2_but_does_not_create_a_new_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+            _write_session(src, "sid-key")
+            sd.ensure_ref_key(cfg)
+            ref = sd.make_path_ref(cfg, src, "claude", sid="sid-key")
+            os.remove(sd._ref_key_path(cfg))
+            res = sd.resolve_ref(cfg, ref)
+            self.assertEqual(res.status, "key_missing")
+            self.assertFalse(os.path.exists(sd._ref_key_path(cfg)))
+            self.assertFalse(os.path.exists(sd._roots_path(cfg)))
+
+    def test_masked_component_scan_is_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            with mock.patch.object(sd, "_local_usernames",
+                                   return_value=["testuser"]):
+                src = os.path.join(cfg.claude_root,
+                                   "c--Users-testuser-shop", "a.jsonl")
+                _write_session(src, "sid-cache")
+                sd.ensure_ref_key(cfg)
+                ref = sd.make_path_ref(cfg, src, "claude", sid="sid-cache")
+                with mock.patch.object(sd.os, "listdir",
+                                       wraps=os.listdir) as listed:
+                    sd.resolve_ref(cfg, ref)
+                    first = listed.call_count
+                    sd.resolve_ref(cfg, ref)
+                    self.assertEqual(listed.call_count, first)
+                self.assertGreaterEqual(first, 1)
+
+    def test_recovery_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+            _write_session(src, "sid-limit")
+            sd.ensure_ref_key(cfg)
+            ref = sd.make_path_ref(cfg, src, "claude", sid="sid-limit")
+            os.remove(src)
+            for i in range(3):
+                _write_session(os.path.join(
+                    cfg.claude_root, f"p{i}", "b.jsonl"), "sid-limit")
+            with mock.patch.object(sd, "_RECOVERY_MAX_FILES", 1):
+                self.assertEqual(sd.resolve_ref(cfg, ref).status,
+                                 "recovery_limited")
+
+    def test_binding_chain_and_cycle(self):
+        a, b, c = "r2_" + "a" * 32, "r2_" + "b" * 32, "r2_" + "c" * 32
+        self.assertTrue(sd._follow_binding({a: b, b: c}, a, c))
+        self.assertFalse(sd._follow_binding({a: b, b: a}, a, c))
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            sd.ensure_ref_key(cfg)
+            with mock.patch.object(sd, "_root_id_for_path", return_value=c):
+                sd.save_root_bindings(cfg, {c: b})
+                rc = sd.cmd_rebind_root(cfg, b, "claude", False, False)
+                self.assertEqual(rc, 1)
+
+    def test_repair_ref_writes_only_v2_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+            _write_session(src, "sid-repair")
+            index = {"version": 1, "sessions": {"sid-repair": {
+                "sid": "sid-repair", "source": "~/a.jsonl"}}}
+            with open(cfg.index_file, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False)
+            before = _snapshot(tmp)
+            self.assertEqual(sd.cmd_repair_ref(
+                cfg, "sid-repair", src, None, True), 0)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertEqual(sd.cmd_repair_ref(
+                cfg, "sid-repair", src, None, False), 0)
+            rec = sd.load_index(cfg)["sessions"]["sid-repair"]
+            self.assertEqual(rec["source_ref"]["v"], 2)
+            self.assertNotIn(tmp, json.dumps(rec, ensure_ascii=False))
+            self.assertEqual(sd.resolve_meta(cfg, rec, "source").path, src)
+
+
+class TestRefReadOnly(unittest.TestCase):
+    def _legacy_setup(self, tmp):
+        cfg = make_cfg(tmp)
+        src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+        _write_session(src, "sid-ro")
+        obs = os.path.join(cfg.obsidian_dir, "2026-11", "x.md")
+        os.makedirs(os.path.dirname(obs))
+        with open(obs, "w", encoding="utf-8") as f:
+            f.write('---\ntitle: "x"\nproject: p\nsession: "sid-ro"\n---\n\n'
+                    '## 这一段在做什么\n\nhello\n')
+        index = {"version": 1, "sessions": {"sid-ro": {
+            "sid": "sid-ro", "date": "2026-11-01", "project": "p", "title": "x",
+            "source": src, "file": obs,
+            "file_ref": {"root": "obsidian", "rel": "2026-11/x.md"},
+            "source_ref": {"root": "claude", "rel": "proj/a.jsonl"}}}}
+        with open(cfg.index_file, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False)
+        return cfg
+
+    def test_find_and_context_never_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._legacy_setup(tmp)
+            before = _snapshot(tmp)
+            out, err = StringIO(), StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                sd.cmd_find(cfg, "hello", 3, None)
+                sd.cmd_context(cfg, 5, None)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertFalse(os.path.exists(sd._ref_key_path(cfg)))
+            self.assertFalse(os.path.exists(sd._roots_path(cfg)))
+            self.assertFalse(os.path.exists(cfg.lock_file))
+            self.assertIn("尚未迁移", err.getvalue())
+
+    def test_migrate_dry_run_and_real_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._legacy_setup(tmp)
+            before = _snapshot(tmp)
+            self.assertEqual(sd.cmd_migrate(cfg, True), 0)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertFalse(os.path.exists(sd._ref_key_path(cfg)))
+            self.assertEqual(sd.cmd_migrate(cfg, False), 0)
+            self.assertTrue(os.path.exists(sd._ref_key_path(cfg)))
+            self.assertEqual(sd.load_index(cfg)["sessions"]["sid-ro"]
+                             ["file_ref"]["v"], 2)
+            after = _snapshot(tmp)
+            self.assertEqual(sd.cmd_migrate(cfg, False), 0)
+            self.assertEqual(_snapshot(tmp), after)
+
+    def test_roots_lists_bindings_without_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._legacy_setup(tmp)
+            sd.cmd_migrate(cfg, False)
+            out = StringIO()
+            with redirect_stdout(out), redirect_stderr(StringIO()):
+                rc = sd.cmd_roots(cfg)
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("claude", text)
+            self.assertIn("refs=", text)
+            self.assertIn("r2_", text)
+            self.assertNotIn(tmp, text)
+
+    def test_find_reports_unresolved_instead_of_empty_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            index = {"version": 1, "sessions": {"sid-bad": {
+                "sid": "sid-bad", "date": "2026-11-01", "project": "p",
+                "title": "x", "file": "~/vault/missing.md"}}}
+            with open(cfg.index_file, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False)
+            out, err = StringIO(), StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = sd.cmd_find(cfg, "missing", 3, None)
+            self.assertEqual(rc, 1)
+            self.assertIn("无法定位", err.getvalue())
+            self.assertIn("legacy_redacted", err.getvalue())
+
+    def test_unresolved_summary_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            index = {"version": 1, "sessions": {"sid-bad": {
+                "sid": "sid-bad", "date": "2026-11-01", "project": "p",
+                "title": "x", "file": "~/vault/missing.md"}}}
+            with open(cfg.index_file, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False)
+            out = StringIO()
+            with redirect_stdout(out), redirect_stderr(StringIO()):
+                rc = sd.cmd_context(cfg, 5, None)
+            self.assertEqual(rc, 1)
+            self.assertIn("legacy_redacted", out.getvalue())
+            self.assertNotIn("（摘要文件缺失）", out.getvalue())
 
 
 class TestRepoHygiene(unittest.TestCase):

@@ -19,17 +19,20 @@ SessionDigest — 把 Claude Code / Codex 的本地会话记录蒸馏成结构�
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -66,6 +69,8 @@ class Config:
     verify: bool = True
     redact: str = "strict"
     verbose: bool = False
+    ref_key_file: Optional[str] = None
+    roots_file: Optional[str] = None
 
 
 @dataclass
@@ -319,9 +324,22 @@ def safe_error(exc, mode: str = "strict") -> str:
     return redact_text(str(exc), mode)
 
 
-# 路径引用：元数据里只存“根目录 + 相对路径”，不存绝对路径。
-# 根目录名固定，改配置后 ref 可能失效，调用方回退旧的绝对路径字段。
+# 路径引用 v2：不保存绝对路径，也不要求相对路径的每个目录名都是明文。
+#
+#   {"v": 2, "root": "claude", "root_id": "r2_...",
+#    "parts": [{"n": "proj"}, {"h": "h2_..."}, {"n": "a.jsonl"}],
+#    "sid": "...", "hint": {"size": 1234, "head_sha1": "..."}}
+#
+# root_id 是本地密钥对规范化根目录做的 HMAC；h 是对敏感目录名做的 HMAC。
+# 根目录整体移动后用 roots.json 的绑定把旧 root_id 指到新 root_id，
+# 历史 ref 不需要修改。
 _REF_ROOTS = ("obsidian", "memory", "out", "claude", "codex")
+_REF_VERSION = 2
+_KEY_DOMAIN_ROOT = b"root\0"
+_KEY_DOMAIN_PART = b"part\0"
+_RECOVERY_MAX_FILES = 5000
+_RECOVERY_MAX_SECONDS = 2.0
+_TOKEN_CACHE: dict = {}
 
 
 def _root_dir(cfg: Config, root: str) -> Optional[str]:
@@ -350,10 +368,131 @@ def _is_within(path: str, root: str) -> bool:
         return False
 
 
+def _norm_root(path: str) -> str:
+    """根目录规范化：展开 ~、绝对路径、解析符号链接、统一大小写与分隔符。"""
+    p = os.path.realpath(_abs_path(path))
+    p = os.path.normcase(p).replace("\\", "/")
+    return p.rstrip("/") or p
+
+
+def _norm_part(name: str) -> str:
+    """目录项规范化：Unicode NFC + 平台大小写规则。"""
+    return os.path.normcase(unicodedata.normalize("NFC", str(name)))
+
+
+def _ref_key_path(cfg: Config) -> str:
+    return _expand(cfg.ref_key_file) or os.path.join(_state_dir(cfg), "digest.key")
+
+
+def _roots_path(cfg: Config) -> str:
+    return _expand(cfg.roots_file) or os.path.join(_state_dir(cfg), "roots.json")
+
+
+def _load_ref_key(cfg: Config, create: bool = False) -> Optional[bytes]:
+    """读取本地 HMAC 密钥；create=False 时绝不写盘（只读命令必须安全）。"""
+    path = _ref_key_path(cfg)
+    try:
+        with open(path, "rb") as f:
+            key = f.read()
+        if len(key) >= 16:
+            return key
+    except OSError:
+        pass
+    if not create:
+        return None
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    key = os.urandom(32)
+    # Windows 上 os.open 默认是文本模式，会把随机字节里的 \n 写成 \r\n，
+    # 导致“返回的密钥”和“文件里的密钥”不一致；必须显式加 O_BINARY。
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+        try:
+            view = memoryview(key)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        return key
+    except FileExistsError:
+        # 另一个进程刚创建，读它的
+        return _load_ref_key(cfg, create=False)
+    except OSError:
+        return None
+
+
+def ensure_ref_key(cfg: Config) -> Optional[bytes]:
+    """写命令入口调用；只读命令不要调用。"""
+    return _load_ref_key(cfg, create=True)
+
+
+def _hmac_hex(key: bytes, domain: bytes, value: str) -> str:
+    return hmac.new(key, domain + value.encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def _root_id_for_path(key: bytes, path: str) -> str:
+    return "r2_" + _hmac_hex(key, _KEY_DOMAIN_ROOT, _norm_root(path))
+
+
+def _part_token(key: bytes, name: str) -> str:
+    return "h2_" + _hmac_hex(key, _KEY_DOMAIN_PART, _norm_part(name))
+
+
+def _sensitive_component(name: str) -> bool:
+    """目录名是否应改成 HMAC：严格脱敏会改动它，或命中已知用户目录形态。"""
+    if not name:
+        return False
+    if redact_text(name, "strict") != name:
+        return True
+    low = name.lower()
+    if low.startswith("c--users-") or "-users-" in low:
+        return True
+    return False
+
+
+def _path_hint(path: Optional[str]) -> Optional[dict]:
+    """恢复线索：只存大小和前 64KB 哈希，不存内容。"""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    hint = {"size": size}
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(65536)
+        if chunk:
+            hint["head_sha1"] = hashlib.sha1(chunk).hexdigest()[:16]
+    except OSError:
+        pass
+    return hint
+
+
+def _parts_for_rel(key: bytes, rel: str) -> List[dict]:
+    parts = []
+    names = rel.replace(os.sep, "/").split("/") if os.sep != "/" \
+        else rel.split("/")
+    for name in names:
+        if not name or name == ".":
+            continue
+        if _sensitive_component(name):
+            parts.append({"h": _part_token(key, name)})
+        else:
+            parts.append({"n": name})
+    return parts
+
+
 def make_path_ref(cfg: Config, path: Optional[str],
-                  preferred: Optional[str] = None) -> Optional[dict]:
-    """把绝对路径转成 {root, rel}；不在已知根目录内则返回 None。"""
+                  preferred: Optional[str] = None,
+                  sid: Optional[str] = None,
+                  key: Optional[bytes] = None) -> Optional[dict]:
+    """把绝对路径转成 v2 ref；不在已知根目录内或没有密钥则返回 None。"""
     if not path:
+        return None
+    key = key or _load_ref_key(cfg, create=False)
+    if not key:
         return None
     order = ([preferred] if preferred else []) + \
             [r for r in _REF_ROOTS if r != preferred]
@@ -367,37 +506,324 @@ def make_path_ref(cfg: Config, path: Optional[str],
             continue
         if rel == os.pardir or rel.startswith(os.pardir + os.sep):
             continue
-        return {"root": root, "rel": rel.replace("\\", "/")}
+        ref = {
+            "v": _REF_VERSION,
+            "root": root,
+            "root_id": _root_id_for_path(key, base),
+            "parts": _parts_for_rel(key, rel),
+        }
+        if sid:
+            ref["sid"] = sid
+        hint = _path_hint(path)
+        if hint:
+            ref["hint"] = hint
+        return ref
     return None
 
 
-def resolve_path_ref(cfg: Config, ref) -> Optional[str]:
-    """把 {root, rel} 还原成绝对路径；越界或结构不对返回 None。"""
-    if not isinstance(ref, dict):
+def _ref_from_rel(cfg: Config, root: str, rel: str, key: bytes,
+                  sid: Optional[str] = None) -> Optional[dict]:
+    base = _root_dir(cfg, root)
+    if not base or not rel:
         return None
+    path = os.path.abspath(os.path.join(_abs_path(base), *rel.split("/")))
+    if not _is_within(path, base):
+        return None
+    ref = {
+        "v": _REF_VERSION,
+        "root": root,
+        "root_id": _root_id_for_path(key, base),
+        "parts": _parts_for_rel(key, rel),
+    }
+    if sid:
+        ref["sid"] = sid
+    hint = _path_hint(path)
+    if hint:
+        ref["hint"] = hint
+    return ref
+
+
+def _legacy_plain_path(raw) -> bool:
+    """旧字段是否是未脱敏、可直接使用的绝对路径。"""
+    if not isinstance(raw, str) or not raw:
+        return False
+    if raw.startswith("~") or "<" in raw or ">" in raw or "***" in raw:
+        return False
+    return os.path.isabs(raw) or bool(re.match(r"^[A-Za-z]:[\\/]", raw))
+
+
+def load_root_bindings(cfg: Config) -> dict:
+    """只读 roots.json。里面只有 root_id 之间的绑定，没有路径。"""
+    try:
+        with open(_roots_path(cfg), encoding="utf-8") as f:
+            data = json.load(f)
+        bindings = data.get("bindings") if isinstance(data, dict) else None
+        return bindings if isinstance(bindings, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_root_bindings(cfg: Config, bindings: dict) -> None:
+    data = {"version": 1, "bindings": bindings}
+    write_text_atomic(_roots_path(cfg),
+                      json.dumps(data, ensure_ascii=False, indent=1))
+
+
+def _follow_binding(bindings: dict, start: str, target: str,
+                    limit: int = 16) -> bool:
+    """沿 old -> new 绑定链走，能否从 start 到达 target；检测成环。"""
+    cur, seen = start, set()
+    while cur:
+        if cur == target:
+            return True
+        if cur in seen or len(seen) >= limit:
+            return False
+        seen.add(cur)
+        nxt = bindings.get(cur)
+        if isinstance(nxt, dict):
+            nxt = nxt.get("to")
+        cur = nxt if isinstance(nxt, str) else None
+    return False
+
+
+def _bind_root_path(cfg: Config, kind: str, target: str,
+                    key: bytes) -> Tuple[Optional[str], str]:
+    root = _root_dir(cfg, kind)
+    if not root:
+        return None, "root_not_configured"
+    current = _root_id_for_path(key, root)
+    if current == target or _follow_binding(load_root_bindings(cfg), target, current):
+        return _abs_path(root), "ok"
+    return None, "unbound_root"
+
+
+@dataclass
+class PathResolution:
+    path: Optional[str] = None
+    status: str = "missing"
+    detail: str = ""
+    candidates: List[str] = field(default_factory=list)
+    recovered: bool = False
+
+    def ok(self) -> bool:
+        return self.status in ("ok", "recovered")
+
+
+def _dir_token_map(base: str, key: bytes) -> Dict[str, List[str]]:
+    """一次列目录，建立 HMAC(token) -> 目录项 的映射；带 mtime 失效。"""
+    try:
+        st = os.stat(base)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    cache_key = (base, hashlib.sha256(key).hexdigest()[:8], sig)
+    cached = _TOKEN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    out: Dict[str, List[str]] = {}
+    try:
+        for name in os.listdir(base):
+            out.setdefault(_part_token(key, name), []).append(name)
+    except OSError:
+        return {}
+    if len(_TOKEN_CACHE) > 512:
+        _TOKEN_CACHE.clear()
+    _TOKEN_CACHE[cache_key] = out
+    return out
+
+
+def _resolve_v2(cfg: Config, ref: dict, rec: Optional[dict]) -> PathResolution:
+    kind = ref.get("root")
+    target = ref.get("root_id")
+    parts = ref.get("parts")
+    if not isinstance(kind, str) or not isinstance(target, str) \
+            or not isinstance(parts, list) or not parts:
+        return PathResolution(status="invalid")
+    key = _load_ref_key(cfg, create=False)
+    if not key:
+        return PathResolution(status="key_missing")
+    base, bind_status = _bind_root_path(cfg, kind, target, key)
+    if not base:
+        return PathResolution(status=bind_status)
+
+    cur = base
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        if not isinstance(part, dict):
+            return PathResolution(status="invalid")
+        if isinstance(part.get("n"), str) and part["n"]:
+            name = part["n"]
+            if os.sep in name or "/" in name:
+                return PathResolution(status="invalid")
+        elif isinstance(part.get("h"), str) and part["h"]:
+            matches = _dir_token_map(cur, key).get(part["h"], [])
+            if len(matches) > 1:
+                return PathResolution(status="ambiguous",
+                                      detail="masked-component-collision",
+                                      candidates=[os.path.join(cur, m) for m in matches])
+            if not matches:
+                return _recover(cfg, kind, base, ref, rec)
+            name = matches[0]
+        else:
+            return PathResolution(status="invalid")
+        cur = os.path.join(cur, name)
+        if not last and not os.path.isdir(cur):
+            return _recover(cfg, kind, base, ref, rec)
+
+    if not _is_within(cur, base):
+        return PathResolution(status="invalid", detail="outside-root")
+    if os.path.exists(cur):
+        return PathResolution(path=cur, status="ok")
+    return _recover(cfg, kind, base, ref, rec)
+
+
+def _resolve_v1(cfg: Config, ref: dict) -> PathResolution:
     root_name = ref.get("root")
-    if not isinstance(root_name, str):
-        return None
-    root = _root_dir(cfg, root_name)
     rel = ref.get("rel")
-    if not root or not isinstance(rel, str) or not rel:
-        return None
-    base = _abs_path(root)
-    path = os.path.abspath(os.path.join(base, *rel.split("/")))
-    return path if _is_within(path, base) else None
+    if not isinstance(root_name, str) or not isinstance(rel, str) or not rel:
+        return PathResolution(status="invalid")
+    base = _root_dir(cfg, root_name)
+    if not base:
+        return PathResolution(status="root_not_configured")
+    path = os.path.abspath(os.path.join(_abs_path(base), *rel.split("/")))
+    if not _is_within(path, base):
+        return PathResolution(status="invalid", detail="outside-root")
+    if os.path.exists(path):
+        return PathResolution(path=path, status="ok")
+    return PathResolution(status="missing")
+
+
+def _file_contains(path: str, needle: str, limit: int = 65536) -> bool:
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit)
+        return needle.encode("utf-8") in raw
+    except OSError:
+        return False
+
+
+def _candidate_score(path: str, sid: str, hint: dict, basename: str) -> int:
+    score = 0
+    name = os.path.basename(path)
+    if basename and name == basename:
+        score += 8
+    if sid:
+        # 知道 sid 时，sid 是硬条件：文件名相同但 sid 不同的文件不能算候选
+        if sid in name:
+            score += 6
+        elif _file_contains(path, sid):
+            score += 4
+        else:
+            return -1
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = -1
+    if hint.get("size") is not None and size == hint["size"]:
+        score += 2
+    if hint.get("head_sha1"):
+        try:
+            with open(path, "rb") as f:
+                chunk = f.read(65536)
+            if hashlib.sha1(chunk).hexdigest()[:16] == hint["head_sha1"]:
+                score += 4
+        except OSError:
+            pass
+    return score
+
+
+def _recover(cfg: Config, kind: str, base: str, ref: dict,
+             rec: Optional[dict]) -> PathResolution:
+    """精确解析失败后，用 sid / 文件名 / 大小 / 前缀哈希定位，限时限量。"""
+    sid = ref.get("sid") or (rec or {}).get("sid") or ""
+    sid = str(sid) if sid else ""
+    hint = ref.get("hint") if isinstance(ref.get("hint"), dict) else {}
+    basename = ""
+    for part in reversed(ref.get("parts") or []):
+        if isinstance(part, dict) and isinstance(part.get("n"), str):
+            basename = part["n"]
+            break
+
+    if not sid and not basename and not hint:
+        return PathResolution(status="missing")
+
+    pattern = os.path.join(base, "**", "*.jsonl") if kind in ("claude", "codex") \
+        else os.path.join(base, "**", "*.md")
+    started = time.monotonic()
+    scanned = 0
+    matches = []
+    limited = False
+    try:
+        paths = glob.iglob(pattern, recursive=True)
+        for path in paths:
+            scanned += 1
+            if scanned > _RECOVERY_MAX_FILES:
+                limited = True
+                break
+            if time.monotonic() - started > _RECOVERY_MAX_SECONDS:
+                limited = True
+                break
+            score = _candidate_score(path, sid, hint, basename)
+            if score > 0:
+                matches.append((score, path))
+    except OSError:
+        return PathResolution(status="unreadable", detail="recovery-scan-failed")
+
+    if limited:
+        return PathResolution(status="recovery_limited",
+                              detail=f"scanned={scanned}")
+    if not matches:
+        return PathResolution(status="missing")
+    matches.sort(key=lambda x: x[0], reverse=True)
+    unique = list(dict.fromkeys(p for _s, p in matches))
+    if len(unique) == 1:
+        return PathResolution(path=unique[0], status="recovered", recovered=True)
+    return PathResolution(status="ambiguous", candidates=unique,
+                          detail=f"candidates={len(unique)}")
+
+
+def resolve_ref(cfg: Config, ref, rec: Optional[dict] = None) -> PathResolution:
+    if not isinstance(ref, dict):
+        return PathResolution(status="invalid")
+    if ref.get("v") == _REF_VERSION:
+        return _resolve_v2(cfg, ref, rec)
+    if "rel" in ref:
+        return _resolve_v1(cfg, ref)
+    return PathResolution(status="invalid")
+
+
+def resolve_meta(cfg: Config, rec: dict, key: str) -> PathResolution:
+    """先解析 ref；只有未脱敏的旧绝对路径才允许作为运行期回退。"""
+    if not isinstance(rec, dict):
+        return PathResolution(status="invalid")
+    res = resolve_ref(cfg, rec.get(key + "_ref"), rec)
+    if res.ok():
+        return res
+
+    legacy = rec.get(key)
+    if isinstance(legacy, str) and legacy:
+        if _legacy_plain_path(legacy):
+            path = os.path.expanduser(legacy)
+            if os.path.exists(path):
+                return PathResolution(path=path, status="ok", detail="legacy-path")
+            if res.status not in ("ambiguous", "recovery_limited", "unreadable"):
+                return PathResolution(status="missing", detail="legacy-path-missing")
+        elif res.status in ("missing", "invalid", "legacy_redacted",
+                            "root_not_configured"):
+            return PathResolution(status="legacy_redacted", detail=res.detail)
+    return res
+
+
+def resolve_path_ref(cfg: Config, ref) -> Optional[str]:
+    """兼容旧调用：只返回可用的路径，不暴露状态。"""
+    res = resolve_ref(cfg, ref)
+    return res.path if res.ok() else None
 
 
 def resolve_meta_path(cfg: Config, rec: dict, key: str) -> Optional[str]:
-    """优先用 ref，解析不到再回退旧版绝对路径字段。"""
-    if not isinstance(rec, dict):
-        return None
-    path = resolve_path_ref(cfg, rec.get(key + "_ref"))
-    if path and os.path.exists(path):
-        return path
-    legacy = rec.get(key)
-    if isinstance(legacy, str) and legacy:
-        return os.path.expanduser(legacy)
-    return path
+    """兼容旧调用：只返回可用的路径，不暴露状态。"""
+    res = resolve_meta(cfg, rec, key)
+    return res.path if res.ok() else None
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1658,7 @@ def save_index(cfg: Config, index: dict) -> None:
 
 def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
                  source: str, mode: str) -> None:
+    ensure_ref_key(cfg)
     index = load_index(cfg)
     path = obsidian_path(cfg, info, sid)
     if not path and cfg.memory_dir:
@@ -1245,9 +1672,10 @@ def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
         "sid": sid,
         "file": redact_text(path or "", cfg.redact),
         "source": redact_text(source or "", cfg.redact),
-        "file_ref": make_path_ref(cfg, path, "obsidian"),
+        "file_ref": make_path_ref(cfg, path, "obsidian", sid=sid),
         "source_ref": make_path_ref(
-            cfg, source, "claude" if info.get("kind") == "claude" else "codex"),
+            cfg, source, "claude" if info.get("kind") == "claude" else "codex",
+            sid=sid),
         "mode": mode,
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1270,12 +1698,13 @@ def save_failures(cfg: Config, failures: dict) -> None:
 
 def record_failure(cfg: Config, key: str, path: str, error: str,
                    kind: str = "claude") -> None:
+    ensure_ref_key(cfg)
     failures = load_failures(cfg)
     ent = failures.get(key) or {"attempts": 0}
     ent.update({
         "path": redact_text(str(path or ""), cfg.redact),
         "path_ref": make_path_ref(
-            cfg, path, "claude" if kind == "claude" else "codex"),
+            cfg, path, "claude" if kind == "claude" else "codex", sid=key),
         "kind": kind,
         "error": redact_text(str(error), cfg.redact)[:500],
         "attempts": int(ent.get("attempts", 0)) + 1,
@@ -1310,18 +1739,77 @@ def save_state(cfg: Config, state: dict) -> None:
                       json.dumps(state, ensure_ascii=False, indent=1))
 
 
-def scrub_state(cfg: Config, state: dict) -> bool:
-    """原地脱敏旧 state 条目，并补 source_ref；返回是否有改动。"""
+def ref_migration_status(cfg: Config, ref, raw=None) -> str:
+    """只读判断一条 ref 的状态，不需要密钥、不写盘。"""
+    if isinstance(ref, dict) and ref.get("v") == _REF_VERSION:
+        return "ok"
+    if isinstance(ref, dict) and isinstance(ref.get("rel"), str):
+        root = ref.get("root")
+        return "v1" if isinstance(root, str) and _root_dir(cfg, root) \
+            else "unconfigured"
+    if _legacy_plain_path(raw):
+        for kind in _REF_ROOTS:
+            base = _root_dir(cfg, kind)
+            if base and _is_within(raw, base):
+                return "legacy_raw"
+        return "legacy_outside_root"
+    if isinstance(raw, str) and raw:
+        return "legacy_redacted"
+    return "none"
+
+
+def upgrade_ref(cfg: Config, ref, sid: Optional[str] = None,
+                raw=None, key: Optional[bytes] = None):
+    """把 v1 / 无 ref 的记录升级成 v2；返回 (新 ref, 状态)。"""
+    key = key or _load_ref_key(cfg, create=False)
+    if isinstance(ref, dict) and ref.get("v") == _REF_VERSION:
+        new = copy.deepcopy(ref)
+        changed = False
+        if sid and not new.get("sid"):
+            new["sid"] = sid
+            changed = True
+        return new, ("upgraded" if changed else "ok")
+    if isinstance(ref, dict) and isinstance(ref.get("rel"), str):
+        root = ref.get("root")
+        if not isinstance(root, str) or not _root_dir(cfg, root):
+            return ref, "unconfigured"
+        if not key:
+            return ref, "key_missing"
+        new = _ref_from_rel(cfg, root, ref["rel"], key, sid=sid)
+        return (new, "upgraded") if new else (ref, "invalid")
+    if _legacy_plain_path(raw):
+        if not key:
+            return None, "key_missing"
+        new = make_path_ref(cfg, raw, sid=sid, key=key)
+        return (new, "legacy_raw") if new else (None, "legacy_outside_root")
+    if isinstance(raw, str) and raw:
+        return None, "legacy_redacted"
+    return None, "none"
+
+
+def _bump(report: Optional[dict], section: str, status: str) -> None:
+    if report is None:
+        return
+    report.setdefault(section, Counter())[status] += 1
+
+
+def scrub_state(cfg: Config, state: dict,
+                report: Optional[dict] = None) -> bool:
+    """原地脱敏旧 state 条目，并把 ref 升级到 v2；返回是否有改动。"""
     changed = False
-    for entry in state.values():
+    key_bytes = _load_ref_key(cfg, create=False)
+    for sid, entry in state.items():
         if not isinstance(entry, dict):
             continue
-        raw_source = entry.get("source")
-        if isinstance(raw_source, str) and raw_source and "source_ref" not in entry:
-            ref = make_path_ref(cfg, raw_source)
-            if ref:
-                entry["source_ref"] = ref
-                changed = True
+        status = ref_migration_status(cfg, entry.get("source_ref"),
+                                      entry.get("source"))
+        _bump(report, "state", status)
+        new_ref, new_status = upgrade_ref(
+            cfg, entry.get("source_ref"), sid=str(sid),
+            raw=entry.get("source"), key=key_bytes)
+        if new_ref is not None and new_ref != entry.get("source_ref"):
+            entry["source_ref"] = new_ref
+            changed = True
         for key in ("first_title", "source"):
             value = entry.get(key)
             if not isinstance(value, str):
@@ -1330,30 +1818,42 @@ def scrub_state(cfg: Config, state: dict) -> bool:
             if clean != value:
                 entry[key] = clean
                 changed = True
+        if new_status in ("key_missing", "invalid", "unconfigured"):
+            _bump(report, "state_errors", new_status)
     return changed
 
 
-def migrate_index(cfg: Config, index: dict) -> bool:
-    """旧索引只存绝对路径；先从原始值生成 ref，再脱敏字段。幂等。"""
+def migrate_index(cfg: Config, index: dict,
+                  report: Optional[dict] = None) -> bool:
+    """旧索引只存绝对路径；先生成 v2 ref，再脱敏字段。幂等。"""
     changed = False
     sessions = index.get("sessions")
     if not isinstance(sessions, dict):
         return False
-    for rec in sessions.values():
+    key_bytes = _load_ref_key(cfg, create=False)
+    for sid, rec in sessions.items():
         if not isinstance(rec, dict):
             continue
+        if not rec.get("sid"):
+            rec["sid"] = str(sid)
+            changed = True
         for key in ("file", "source"):
             raw = rec.get(key)
-            if isinstance(raw, str) and raw and key + "_ref" not in rec:
-                ref = make_path_ref(cfg, raw)
-                if ref:
-                    rec[key + "_ref"] = ref
-                    changed = True
+            status = ref_migration_status(cfg, rec.get(key + "_ref"), raw)
+            _bump(report, "index", status)
+            new_ref, new_status = upgrade_ref(
+                cfg, rec.get(key + "_ref"), sid=str(sid), raw=raw,
+                key=key_bytes)
+            if new_ref is not None and new_ref != rec.get(key + "_ref"):
+                rec[key + "_ref"] = new_ref
+                changed = True
             if isinstance(raw, str):
                 clean = redact_text(raw, cfg.redact)
                 if clean != raw:
                     rec[key] = clean
                     changed = True
+            if new_status in ("key_missing", "invalid", "unconfigured"):
+                _bump(report, "index_errors", new_status)
         for key in ("project", "title"):
             value = rec.get(key)
             if isinstance(value, str):
@@ -1364,39 +1864,46 @@ def migrate_index(cfg: Config, index: dict) -> bool:
     return changed
 
 
-def migrate_failures(cfg: Config, failures: dict) -> bool:
-    """旧失败队列的 path 是明文绝对路径；补 ref 后脱敏。幂等。"""
+def migrate_failures(cfg: Config, failures: dict,
+                     report: Optional[dict] = None) -> bool:
+    """旧失败队列的 path 是明文绝对路径；补 v2 ref 后脱敏。幂等。"""
     changed = False
-    for entry in failures.values():
+    key_bytes = _load_ref_key(cfg, create=False)
+    for sid, entry in failures.items():
         if not isinstance(entry, dict):
             continue
         raw = entry.get("path")
-        if isinstance(raw, str) and raw and "path_ref" not in entry:
-            ref = make_path_ref(cfg, raw)
-            if ref:
-                entry["path_ref"] = ref
-                changed = True
+        status = ref_migration_status(cfg, entry.get("path_ref"), raw)
+        _bump(report, "failures", status)
+        new_ref, new_status = upgrade_ref(
+            cfg, entry.get("path_ref"), sid=str(sid), raw=raw, key=key_bytes)
+        if new_ref is not None and new_ref != entry.get("path_ref"):
+            entry["path_ref"] = new_ref
+            changed = True
         if isinstance(raw, str):
             clean = redact_text(raw, cfg.redact)
             if clean != raw:
                 entry["path"] = clean
                 changed = True
+        if new_status in ("key_missing", "invalid", "unconfigured"):
+            _bump(report, "failures_errors", new_status)
     return changed
 
 
-def migrate_metadata(cfg: Config) -> bool:
+def migrate_metadata(cfg: Config, report: Optional[dict] = None) -> bool:
     """非 dry-run 入口统一调用；只在确有改动时写盘。"""
+    ensure_ref_key(cfg)
     changed = False
     state = load_state(cfg)
-    if scrub_state(cfg, state):
+    if scrub_state(cfg, state, report):
         save_state(cfg, state)
         changed = True
     index = load_index(cfg)
-    if migrate_index(cfg, index):
+    if migrate_index(cfg, index, report):
         save_index(cfg, index)
         changed = True
     failures = load_failures(cfg)
-    if migrate_failures(cfg, failures):
+    if migrate_failures(cfg, failures, report):
         save_failures(cfg, failures)
         changed = True
     return changed
@@ -1566,6 +2073,7 @@ def _today(info: dict) -> str:
 
 
 def execute_task(cfg: Config, task: Task, state: dict) -> bool:
+    ensure_ref_key(cfg)
     sid = task.key
     prev_entry = state.get(sid) or {}
     info = dict(task.info)
@@ -1616,7 +2124,8 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             "first_title": redact_text(info.get("_first_title") or "", cfg.redact),
             "source": redact_text(task.path, cfg.redact),
             "source_ref": make_path_ref(
-                cfg, task.path, "claude" if task.kind == "claude" else "codex"),
+                cfg, task.path,
+                "claude" if task.kind == "claude" else "codex", sid=sid),
             "tokens": usage,
             "done_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -1717,9 +2226,12 @@ def _run_nightly(cfg: Config, dry: bool) -> int:
             if key in planned:
                 continue
             f = failures[key]
-            p = resolve_meta_path(cfg, f, "path")
-            if not p or not os.path.exists(p):
+            res = resolve_meta(cfg, f, "path")
+            if not res.ok():
+                print(f"  跳过 {str(key)[:8]}：源文件无法定位（{res.status}）",
+                      file=sys.stderr)
                 continue
+            p = res.path
             kind = f.get("kind") or "claude"
             info = parse_session(p, kind)
             if info["turns"] or info["prompts"]:
@@ -1773,10 +2285,11 @@ def _run_retry_failed(cfg: Config, failures: dict) -> int:
     state = load_state(cfg)
     done = 0
     for key, v in list(failures.items()):
-        path = resolve_meta_path(cfg, v, "path")
-        if not path or not os.path.exists(path):
-            print(f"  跳过 {key[:8]}：源文件不存在")
+        res = resolve_meta(cfg, v, "path")
+        if not res.ok():
+            print(f"  跳过 {key[:8]}：源文件无法定位（{res.status}）")
             continue
+        path = res.path
         kind = v.get("kind") or "claude"
         info = parse_session(path, kind)
         if not info["turns"] and not info["prompts"]:
@@ -1792,23 +2305,80 @@ def _run_retry_failed(cfg: Config, failures: dict) -> int:
     return 0 if done == len(failures) else 1
 
 
-def summary_text(cfg: Config, rec: dict) -> str:
-    """从索引记录里读回一份摘要的正文（去掉 frontmatter）。"""
-    path = resolve_meta_path(cfg, rec, "file")
-    if not path or not os.path.exists(path):
-        return ""
+def summary_result(cfg: Config, rec: dict) -> Tuple[str, PathResolution]:
+    """读回摘要正文，同时返回明确状态，避免“空字符串”混淆缺失与空文件。"""
+    res = resolve_meta(cfg, rec, "file")
+    if not res.ok():
+        return "", res
+    path = res.path
     try:
         with open(path, encoding="utf-8") as fh:
             raw = fh.read()
     except Exception:
-        return ""
+        return "", PathResolution(path=path, status="unreadable",
+                                  detail="read-failed")
     monthly_root = os.path.join(cfg.memory_dir, "sessions") if cfg.memory_dir else ""
     is_monthly = bool(monthly_root) and _is_within(path, monthly_root)
-    text = block_text(raw, rec.get("sid", "")) if is_monthly \
-        else strip_frontmatter(raw)
+    if is_monthly:
+        text = block_text(raw, rec.get("sid", ""))
+        if text is None:
+            return "", PathResolution(path=path, status="missing_block",
+                                      detail="session-block-not-found")
+    else:
+        text = strip_frontmatter(raw)
     # 顺手去掉正文开头的一级标题，避免和输出里的“## 日期 · 项目”重复
     text = re.sub(r"^\s*# [^\n]*\n+", "", text or "", count=1)
-    return redact_text(text, cfg.redact)
+    text = redact_text(text, cfg.redact)
+    if not text.strip():
+        return text, PathResolution(path=path, status="empty",
+                                    recovered=res.recovered)
+    return text, PathResolution(path=path, status=res.status,
+                                detail=res.detail, recovered=res.recovered)
+
+
+def summary_text(cfg: Config, rec: dict) -> str:
+    """兼容调用：只要正文，状态由 summary_result 提供。"""
+    return summary_result(cfg, rec)[0]
+
+
+def migration_status_counts(cfg: Config) -> Counter:
+    """只读统计旧 ref 数量，供 --find / --context 提示。"""
+    counts: Counter = Counter()
+    state = load_state(cfg)
+    for entry in state.values():
+        if not isinstance(entry, dict):
+            continue
+        st = ref_migration_status(cfg, entry.get("source_ref"),
+                                  entry.get("source"))
+        if st not in ("ok", "none"):
+            counts[st] += 1
+    index = load_index(cfg)
+    for rec in (index.get("sessions") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        for key in ("file", "source"):
+            st = ref_migration_status(cfg, rec.get(key + "_ref"),
+                                      rec.get(key))
+            if st not in ("ok", "none"):
+                counts[st] += 1
+    for entry in load_failures(cfg).values():
+        if not isinstance(entry, dict):
+            continue
+        st = ref_migration_status(cfg, entry.get("path_ref"),
+                                  entry.get("path"))
+        if st not in ("ok", "none"):
+            counts[st] += 1
+    return counts
+
+
+def legacy_ref_warning(cfg: Config) -> None:
+    """只读命令用：只提示，不迁移、不创建密钥、不写任何文件。"""
+    counts = migration_status_counts(cfg)
+    total = sum(counts.values())
+    if not total:
+        return
+    print(f"提示：检测到 {total} 条旧路径引用尚未迁移。"
+          f"运行 --migrate --dry-run 查看计划。", file=sys.stderr)
 
 
 # 中文用相邻二字切词（不依赖分词库），英文/数字按词切
@@ -1862,7 +2432,8 @@ def _docs_from_vault(cfg: Config) -> List[dict]:
 
 
 def search_summaries(cfg: Config, query: str, top: int,
-                     project: Optional[str]) -> List[dict]:
+                     project: Optional[str],
+                     unresolved: Optional[List[dict]] = None) -> List[dict]:
     """按关键词相关度排序，返回 top 条带 score 的记录。"""
     q = text_tokens(query)
     if not q:
@@ -1876,8 +2447,13 @@ def search_summaries(cfg: Config, query: str, top: int,
 
     docs = []
     for rec in recs:
-        text = summary_text(cfg, rec)
+        text, status = summary_result(cfg, rec)
         if not text:
+            if unresolved is not None:
+                unresolved.append({
+                    "sid": rec.get("sid"),
+                    "status": status.status,
+                })
             continue
         head = f"{rec.get('title', '')} {rec.get('project', '')}"
         docs.append({"rec": rec, "text": text,
@@ -1917,25 +2493,37 @@ def cmd_find(cfg: Config, query: str, top: int, project: Optional[str]) -> int:
     if not text_tokens(query):
         print("查询词太短：至少给一个中文词或两个以上字母/数字。", file=sys.stderr)
         return 2
-    results = search_summaries(cfg, query, top, project)
+    legacy_ref_warning(cfg)
+    unresolved: List[dict] = []
+    results = search_summaries(cfg, query, top, project, unresolved)
     if not results:
         print(f"没有找到与「{_display(cfg, query)}」相关的摘要。", file=sys.stderr)
         print("提示：这是关键词匹配，不是语义检索；换个更具体的词试试，"
               "或者先跑 --nightly 生成摘要。", file=sys.stderr)
+    else:
+        print(f"# 与「{_display(cfg, query)}」相关的 {len(results)} 份摘要\n")
+        for r in results:
+            rec = r["rec"]
+            print(f"## {_display(cfg, str(rec.get('date', ''))[:10])} · "
+                  f"{_display(cfg, rec.get('project'))} · "
+                  f"{_display(cfg, rec.get('title'))}  （相关度 {r['score']:.1f}）")
+            print()
+            print(r["text"].strip())
+            print("\n---")
+    if unresolved:
+        print(f"另有 {len(unresolved)} 份摘要无法定位，未参与匹配：", file=sys.stderr)
+        for item in unresolved[:10]:
+            print(f"  · {str(item.get('sid') or '?')[:8]}：{item['status']}",
+                  file=sys.stderr)
+        if len(unresolved) > 10:
+            print(f"  · 其余 {len(unresolved) - 10} 份略", file=sys.stderr)
+        print("可运行 --migrate 或 --repair-ref 修复引用。", file=sys.stderr)
         return 1
-    print(f"# 与「{_display(cfg, query)}」相关的 {len(results)} 份摘要\n")
-    for r in results:
-        rec = r["rec"]
-        print(f"## {_display(cfg, str(rec.get('date', ''))[:10])} · "
-              f"{_display(cfg, rec.get('project'))} · "
-              f"{_display(cfg, rec.get('title'))}  （相关度 {r['score']:.1f}）")
-        print()
-        print(r["text"].strip())
-        print("\n---")
-    return 0
+    return 0 if results else 1
 
 
 def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
+    legacy_ref_warning(cfg)
     index = load_index(cfg)
     items = list(index["sessions"].values())
     if project:
@@ -1946,14 +2534,22 @@ def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
         print("索引里没有匹配的会话。先跑 --nightly 或 --export。", file=sys.stderr)
         return 1
 
+    failed = False
     for v in items:
-        text = summary_text(cfg, v)
+        text, res = summary_result(cfg, v)
         print(f"\n## {_display(cfg, str(v.get('date', ''))[:10])} · "
               f"{_display(cfg, v.get('project'))} · {_display(cfg, v.get('title'))}")
         print()
-        print(text.strip() or "（摘要文件缺失）")
+        if not res.ok():
+            failed = True
+            print(f"（无法定位摘要文件：{res.status}）")
+        elif not text.strip():
+            failed = True
+            print(f"（摘要文件为空：{res.status}）")
+        else:
+            print(text.strip())
         print("\n---")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_export(cfg: Config) -> int:
@@ -2061,6 +2657,292 @@ def write_plain_session(path: str, info: dict, label: str,
 
 
 # ---------------------------------------------------------------------------
+# ref 迁移与根目录绑定命令
+# ---------------------------------------------------------------------------
+
+def migration_plan(cfg: Config) -> dict:
+    """只读计划：不创建密钥、不写 roots.json、不取锁。"""
+    plan = {
+        "state": Counter(), "index": Counter(), "failures": Counter(),
+        "key_exists": os.path.exists(_ref_key_path(cfg)),
+    }
+    for entry in load_state(cfg).values():
+        if isinstance(entry, dict):
+            plan["state"][ref_migration_status(
+                cfg, entry.get("source_ref"), entry.get("source"))] += 1
+    for rec in (load_index(cfg).get("sessions") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        for key in ("file", "source"):
+            plan["index"][ref_migration_status(
+                cfg, rec.get(key + "_ref"), rec.get(key))] += 1
+    for entry in load_failures(cfg).values():
+        if isinstance(entry, dict):
+            plan["failures"][ref_migration_status(
+                cfg, entry.get("path_ref"), entry.get("path"))] += 1
+    return plan
+
+
+def _print_plan_section(name: str, counts: Counter) -> int:
+    if not counts:
+        print(f"  {name}: 无记录")
+        return 0
+    order = ("ok", "v1", "legacy_raw", "legacy_redacted", "unconfigured",
+             "legacy_outside_root", "key_missing", "invalid", "none")
+    parts = [f"{k}={counts[k]}" for k in order if counts.get(k)]
+    print(f"  {name}: " + "  ".join(parts))
+    return sum(v for k, v in counts.items()
+               if k not in ("ok", "none"))
+
+
+def cmd_migrate(cfg: Config, dry: bool) -> int:
+    if dry:
+        plan = migration_plan(cfg)
+        print("迁移计划（dry-run，不写任何文件）：")
+        pending = 0
+        for name in ("state", "index", "failures"):
+            pending += _print_plan_section(name, plan[name])
+        if not plan["key_exists"]:
+            print("  将创建本地密钥 digest.key（仅用于 HMAC 标识）")
+        print(f"  待处理 ref：{pending}")
+        return 0
+
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        had_key = os.path.exists(_ref_key_path(cfg))
+        report: dict = {}
+        changed = migrate_metadata(cfg, report)
+        plan = migration_plan(cfg)
+        if not had_key:
+            print("已创建本地密钥 digest.key（仅用于 HMAC 标识）。")
+        print("迁移完成。" if changed else "没有需要迁移的 ref。")
+        unresolved = 0
+        for name in ("state", "index", "failures"):
+            counts = plan[name]
+            unresolved += sum(v for k, v in counts.items()
+                              if k not in ("ok", "none"))
+            _print_plan_section(name, counts)
+        if unresolved:
+            # 迁移前记录的 legacy_outside_root 在迁移后会被脱敏成
+            # legacy_redacted，不能从 plan 反推，必须看 report。
+            outside = sum(report.get(name, Counter()).get(
+                "legacy_outside_root", 0)
+                for name in ("state", "index", "failures"))
+            if outside:
+                print(f"有 {outside} 条旧路径不在任何已知根目录内，"
+                      "无法生成 v2 ref；可把文件移到已知根下，"
+                      "或继续依赖旧的明文路径回退。", file=sys.stderr)
+            remaining = unresolved - outside
+            if remaining > 0:
+                print(f"另有 {remaining} 条 ref 无法自动迁移。"
+                      "运行 --migrate --dry-run 查看，"
+                      "或用 --repair-ref 指定实际文件。", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        lock.release()
+
+
+def _collect_ref_roots(cfg: Config) -> Dict[str, Counter]:
+    """统计 state/index/failures 里 v2 ref 的 root_id，不读路径。"""
+    out: Dict[str, Counter] = {r: Counter() for r in _REF_ROOTS}
+
+    def add(ref):
+        if isinstance(ref, dict) and ref.get("v") == _REF_VERSION:
+            kind = ref.get("root")
+            rid = ref.get("root_id")
+            if kind in out and isinstance(rid, str):
+                out[kind][rid] += 1
+
+    for entry in load_state(cfg).values():
+        if isinstance(entry, dict):
+            add(entry.get("source_ref"))
+    for rec in (load_index(cfg).get("sessions") or {}).values():
+        if isinstance(rec, dict):
+            add(rec.get("file_ref"))
+            add(rec.get("source_ref"))
+    for entry in load_failures(cfg).values():
+        if isinstance(entry, dict):
+            add(entry.get("path_ref"))
+    return out
+
+
+def cmd_roots(cfg: Config) -> int:
+    key = _load_ref_key(cfg, create=False)
+    refs = _collect_ref_roots(cfg)
+    bindings = load_root_bindings(cfg)
+    any_ref = any(refs.values())
+    if not any_ref:
+        legacy = migration_status_counts(cfg)
+        if sum(legacy.values()):
+            print("只有旧格式引用，还没有 root_id。先运行 --migrate。")
+        else:
+            print("还没有 v2 路径引用。先在写命令或 --migrate 中生成。")
+        return 0
+    if not key:
+        print("本地密钥不存在，无法计算当前根目录的 root_id。"
+              "先运行 --migrate。", file=sys.stderr)
+    print("根目录绑定（不显示实际路径）：")
+    for kind in _REF_ROOTS:
+        counts = refs[kind]
+        root = _root_dir(cfg, kind)
+        current = _root_id_for_path(key, root) if (key and root) else None
+        if not counts and not current:
+            continue
+        print(f"\n{kind}")
+        if current:
+            print(f"  当前：{current}")
+        else:
+            print("  当前：未配置或缺少密钥")
+        if not counts:
+            print("  历史：无")
+            continue
+        for rid, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+            if current and rid == current:
+                state = "bound"
+            elif current and _follow_binding(bindings, rid, current):
+                state = "bound"
+            else:
+                state = "unbound"
+            print(f"  历史：{rid}  refs={n}  {state}")
+    return 0
+
+
+def cmd_rebind_root(cfg: Config, old_id: str, kind: Optional[str],
+                    dry: bool, force: bool) -> int:
+    if not re.match(r"^r2_[0-9a-f]{32}$", old_id or ""):
+        print("root_id 格式不对，应形如 r2_<32 位十六进制>。", file=sys.stderr)
+        return 2
+    refs = _collect_ref_roots(cfg)
+    if not kind:
+        kinds = [k for k, counts in refs.items() if counts.get(old_id)]
+        if len(kinds) != 1:
+            print("无法确定 root_id 属于哪个根目录；请加 --root-kind "
+                  "obsidian|memory|out|claude|codex。", file=sys.stderr)
+            return 2
+        kind = kinds[0]
+    if kind not in _REF_ROOTS:
+        print("未知的根目录类型。", file=sys.stderr)
+        return 2
+    root = _root_dir(cfg, kind)
+    if not root:
+        print(f"当前没有配置 {kind} 根目录。", file=sys.stderr)
+        return 2
+    key = _load_ref_key(cfg, create=False)
+    if not key and not dry:
+        key = ensure_ref_key(cfg)
+    if not key:
+        print("dry-run：本地密钥尚不存在，实际执行时会先创建 digest.key。")
+        return 0
+    current = _root_id_for_path(key, root)
+    if current == old_id:
+        print("当前根目录已经就是该 root_id，无需绑定。")
+        return 0
+    bindings = load_root_bindings(cfg)
+    existing = bindings.get(old_id)
+    if isinstance(existing, dict):
+        existing = existing.get("to")
+    if existing and existing != current:
+        # 根目录可能又移动了一次：显式重绑覆盖旧目标即可，历史 ref 仍不变
+        print(f"更新 {old_id} 的绑定：{existing} -> {current}")
+    if _follow_binding(bindings, current, old_id):
+        print("这次绑定会形成环，已拒绝。", file=sys.stderr)
+        return 1
+    print(f"将把 {old_id} 绑定到当前 {kind} 根目录 {current}（历史 ref 不变）。")
+    if dry:
+        return 0
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        bindings[old_id] = current
+        save_root_bindings(cfg, bindings)
+        print("已保存 roots.json。")
+        return 0
+    finally:
+        lock.release()
+
+
+def cmd_repair_ref(cfg: Config, sid: str, source: Optional[str],
+                   filepath: Optional[str], dry: bool) -> int:
+    """显式修复一条记录：只写 v2 ref，不保存用户给的绝对路径。"""
+    if not source and not filepath:
+        print("请至少给 --source 或 --file。", file=sys.stderr)
+        return 2
+    for label, path in (("source", source), ("file", filepath)):
+        if path and not os.path.exists(path):
+            print(f"{label} 路径不存在（已脱敏显示）："
+                  f"{redact_text(path, cfg.redact)}", file=sys.stderr)
+            return 2
+    key = _load_ref_key(cfg, create=False)
+    if not key and not dry:
+        key = ensure_ref_key(cfg)
+    if not key:
+        if not dry:
+            print("需要本地密钥；先运行 --migrate。", file=sys.stderr)
+            return 1
+        # dry-run 用一次性占位密钥生成计划，不落盘
+        key = b"\0" * 32
+
+    def build(path, preferred):
+        return make_path_ref(cfg, path, preferred, sid=sid, key=key)
+
+    src_ref = build(source, "claude") if source else None
+    file_ref = build(filepath, "obsidian") if filepath else None
+    if source and not src_ref:
+        print("source 不在已知根目录内，无法生成 ref。", file=sys.stderr)
+        return 2
+    if filepath and not file_ref:
+        print("file 不在已知根目录内，无法生成 ref。", file=sys.stderr)
+        return 2
+
+    state = load_state(cfg)
+    index = load_index(cfg)
+    failures = load_failures(cfg)
+    changed_state = changed_index = changed_failures = False
+    if src_ref and isinstance(state.get(sid), dict):
+        state[sid]["source_ref"] = src_ref
+        changed_state = True
+    if isinstance((index.get("sessions") or {}).get(sid), dict):
+        rec = index["sessions"][sid]
+        if file_ref:
+            rec["file_ref"] = file_ref
+            changed_index = True
+        if src_ref:
+            rec["source_ref"] = src_ref
+            changed_index = True
+    if src_ref and isinstance(failures.get(sid), dict):
+        failures[sid]["path_ref"] = src_ref
+        changed_failures = True
+
+    if not (changed_state or changed_index or changed_failures):
+        print(f"没有找到 {sid[:8]} 对应的记录。", file=sys.stderr)
+        return 1
+    print(f"将修复 {sid[:8]}："
+          f"state={'yes' if changed_state else 'no'} "
+          f"index={'yes' if changed_index else 'no'} "
+          f"failures={'yes' if changed_failures else 'no'}")
+    if dry:
+        return 0
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        if changed_state:
+            save_state(cfg, state)
+        if changed_index:
+            save_index(cfg, index)
+        if changed_failures:
+            save_failures(cfg, failures)
+        print("已修复。")
+        return 0
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2081,6 +2963,8 @@ def build_config(args) -> Config:
         failures_file=_expand(args.failures_file) or os.path.join(sdir, "failures.json"),
         lock_file=_expand(args.lock_file) or state_file + ".lock",
         projects=load_projects(args.projects_file),
+        ref_key_file=_expand(getattr(args, "ref_key_file", None)),
+        roots_file=_expand(getattr(args, "roots_file", None)),
         base_url=base_url,
         api_key=api_key,
         model=model,
@@ -2123,6 +3007,25 @@ def main(argv=None) -> int:
     mode.add_argument("--context", type=int, metavar="N", help="输出最近 N 份摘要的拼接文本")
     mode.add_argument("--find", metavar="QUERY", help="按关键词查找相关摘要（本地匹配）")
     mode.add_argument("--retry-failed", action="store_true", help="只重试失败队列")
+    mode.add_argument("--migrate", action="store_true",
+                      help="把旧路径引用迁移到 v2（配合 --dry-run 只查看计划）")
+    mode.add_argument("--roots", action="store_true",
+                      help="列出根目录 root_id 绑定情况（不显示实际路径）")
+    mode.add_argument("--rebind-root", metavar="ROOT_ID",
+                      help="把历史 root_id 绑定到当前根目录")
+    mode.add_argument("--repair-ref", metavar="SID",
+                      help="用 --source / --file 显式修复一条记录")
+
+    ap.add_argument("--root-kind", choices=list(_REF_ROOTS), default=None,
+                    help="--rebind-root 时指定根目录类型")
+    ap.add_argument("--source", default=None,
+                    help="--repair-ref 的源会话文件路径")
+    ap.add_argument("--file", dest="file_path", default=None,
+                    help="--repair-ref 的摘要文件路径")
+    ap.add_argument("--ref-key-file", default=None,
+                    help="HMAC 密钥文件（默认与 state 同目录的 digest.key）")
+    ap.add_argument("--roots-file", default=None,
+                    help="root_id 绑定文件（默认与 state 同目录的 roots.json）")
 
     ap.add_argument("--top", type=int, default=3, help="--find 返回几条（默认 3）")
     ap.add_argument("--project", default=None, help="--context / --find 时按项目名过滤")
@@ -2173,11 +3076,22 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     if not (args.export or args.llm or args.nightly or args.context
-            or args.find or args.retry_failed):
+            or args.find or args.retry_failed or args.migrate or args.roots
+            or args.rebind_root or args.repair_ref):
         ap.print_help()
         return 0
 
     cfg = build_config(args)
+    if args.roots:
+        return cmd_roots(cfg)
+    if args.migrate:
+        return cmd_migrate(cfg, args.dry_run)
+    if args.rebind_root:
+        return cmd_rebind_root(cfg, args.rebind_root, args.root_kind,
+                               args.dry_run, args.force)
+    if args.repair_ref:
+        return cmd_repair_ref(cfg, args.repair_ref, args.source,
+                              args.file_path, args.dry_run)
     if args.export:
         return cmd_export(cfg)
     if args.llm:

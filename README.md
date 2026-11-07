@@ -118,8 +118,9 @@
 2. **写入摘要文件之前**：Obsidian 笔记、月度文件、`--export` 文档和 README、
    frontmatter 与 `MEMORY.md` 标题。
 3. **写入元数据之前**：`state.json` / `index.json` / `failures.json` 里的标题、
-   项目名、路径。路径改成“根目录 + 相对路径”的引用（`file_ref` / `source_ref` /
-   `path_ref`），需要时再还原；旧数据会在非 dry-run 启动时迁移一次。
+   项目名、路径。路径改成 v2 引用（`file_ref` / `source_ref` / `path_ref`）：
+   `root_id` 是本地密钥对根目录的 HMAC，敏感目录名再单独做 HMAC；不保存绝对路径。
+   旧数据用 `--migrate` 迁移，迁移是幂等的。
 4. **打印之前**：`--find` / `--context` / `--llm` / `--export` 的终端输出、
    失败信息、`--verbose` 的异常栈、锁文件提示。
 
@@ -166,9 +167,51 @@ python session_digest.py --redact off ...              # 完全不处理
 - 代码片段本身的商业逻辑；
 - 图片、截图里的内容。
 
-路径引用依赖目录配置：改了 `--obsidian-dir`、`--memory-dir`、`--claude-root`
-等位置后，旧引用可能失效，程序会回退到旧路径字段；两种都找不到时，对应摘要
-会被当作缺失，而不是读取错误的位置。
+### 路径引用与根目录移动
+
+元数据里的路径引用不再保存绝对路径，也不要求每个目录名都是明文：
+
+- 根目录身份是 `root_id`，由本地密钥 `digest.key` 对规范化根路径做 HMAC；
+- 目录名如果会被脱敏，或命中 `c--Users-*` 这类用户目录形态，就存成 HMAC
+  组件（`h2_...`），解析时扫描同级目录匹配；
+- 每条 ref 带 session id、文件大小和前缀哈希，精确解析失败后才用于恢复；
+- 找不到时不返回空结果，也不猜一个文件，而是明确报告
+  `unbound_root` / `missing` / `ambiguous` / `legacy_redacted` /
+  `key_missing` / `recovery_limited`。
+
+根目录整体移动后，旧 ref 不需要修改：
+
+```bash
+python session_digest.py --roots
+python session_digest.py --rebind-root r2_旧id --claude-root /新位置
+```
+
+`--roots` 只显示 root_id 和引用数量，不显示实际路径。`--rebind-root` 只写
+`roots.json` 的 root_id 绑定，不碰 state/index/failures。
+
+**旧 ref 无法自动恢复时**：`--migrate` 会列出无法迁移的条目；用
+`--repair-ref <sid> --source <新路径>` 或 `--repair-ref <sid> --file <新路径>`
+显式修复。修复只写 v2 ref，不保存你输入的绝对路径。
+
+只读命令（`--find` / `--context`）不会暗中迁移，也不会创建密钥；检测到旧引用
+时只在 stderr 提示。`--migrate --dry-run` 前后文件快照完全一致。
+
+**无法自动恢复的情况与处理：**
+
+| 状态 | 原因 | 用户需要做什么 |
+|---|---|---|
+| `unbound_root` | 根目录搬走或换了配置 | `--roots` 找到旧 root_id，再 `--rebind-root` |
+| `root_not_configured` | 旧 ref 的根目录当前没配 | 补上对应 `--claude-root` / `--obsidian-dir` 等再迁移 |
+| `legacy_redacted` | 旧字段已经被脱敏，原文不可逆 | `--repair-ref <sid> --source/--file <实际路径>` |
+| `key_missing` | `digest.key` 丢失或从未创建 | 从备份恢复同一个密钥；否则只能逐条 `--repair-ref` |
+| `key_missing`（密钥被换新） | 新密钥算出的 root_id / HMAC 与历史不同 | 恢复旧密钥；旧密钥已丢失则历史掩码 ref 无法解析 |
+| `ambiguous` | 多个文件都像目标 | 用 `--repair-ref` 指定唯一文件，程序不会替你猜 |
+| `recovery_limited` | 恢复扫描超过 5000 个文件或 2 秒 | 缩小根目录，或用 `--repair-ref` 直接指定 |
+| `legacy_outside_root` | 旧路径不在任何已知根目录内 | 无法生成 v2 ref；文件仍在时继续用旧路径回退，或把它移到已知根下 |
+
+密钥只用于 HMAC，不加密内容；但**丢了密钥就再也算不出同样的 root_id 和
+`h2_` 组件**。请把 `digest.key` 和 `roots.json` 与 state 一起备份，且不要提交到
+仓库（`.gitignore` 已排除）。
 
 ## 按问题找历史
 
@@ -264,6 +307,13 @@ python session_digest.py --find "库存 架构" --top 3
 | `--failures-file` | 与 state 同目录 | 失败队列 |
 | `--lock-file` | state 文件 + `.lock` | 进程锁，防止两个实例同时写 |
 | `--projects-file` | 无 | 项目名映射，见下 |
+| `--ref-key-file` | 与 state 同目录的 `digest.key` | HMAC 密钥；丢失后掩码 ref 无法解析 |
+| `--roots-file` | 与 state 同目录的 `roots.json` | root_id 绑定；只有 id，没有路径 |
+| `--migrate` | 关 | 迁移旧路径引用；配 `--dry-run` 只查看计划 |
+| `--roots` | 关 | 列出 root_id 与引用数量，不显示路径 |
+| `--rebind-root` | 无 | 把历史 root_id 绑定到当前根目录 |
+| `--root-kind` | 自动判断 | `--rebind-root` 时指定根目录类型 |
+| `--repair-ref` | 无 | 用 `--source` / `--file` 显式修复一条记录 |
 | `--project` | 无 | `--context` / `--find` 时按项目名过滤 |
 | `--top` | 3 | `--find` 返回几条 |
 | `--base-url` / `--api-key` / `--model` | 环境变量 | 模型配置 |
@@ -278,7 +328,7 @@ python session_digest.py --find "库存 架构" --top 3
 | `--no-verify` | 关 | 不把标识符与原文比对，不加 `⚠` |
 | `--redact` | `strict` | 脱敏档位：`off` / `safe` / `strict`（默认把用户名换成 `~`） |
 | `--retry-failed` | 关 | 只重试失败队列 |
-| `--dry-run` | 关 | 只规划、估算，不调用模型不写文件 |
+| `--dry-run` | 关 | 只规划、估算，不调用模型不写文件；`--migrate` 时快照不变 |
 | `--verbose` | 关 | 失败时打印完整堆栈 |
 
 > “消息数”指用户消息与助手消息各计一条。所以 `--min-turns 8` 大约是 4 个来回。
@@ -381,8 +431,8 @@ v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏�
 python -m unittest discover -s tests -v
 ```
 
-54 个用例，覆盖两个解析器、增量读取、前缀哈希、事实校验（含 `--no-verify`）、
-脱敏（密钥/邮箱/内网 IP/主目录路径、发送前与落盘前各一道）、元数据路径引用与
+78 个用例，覆盖两个解析器、增量读取、前缀哈希、事实校验（含 `--no-verify`）、
+脱敏（密钥/邮箱/内网 IP/主目录路径、发送前与落盘前各一道）、v2 路径引用与
 旧数据迁移、读取与异常输出的二次脱敏、月度块替换、规划判定、索引、失败队列、
 `--context`/`--find` 过滤，以及进程锁（含跨进程争抢）、原子写入中断、HTTP 错误、
 超时、非 JSON 响应、模型返回被截断等异常恢复场景。
