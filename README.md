@@ -152,7 +152,7 @@ Claude Code 的目录名是路径编码（如 `c--Users-me-projects-shop`），�
 
 ```json
 {
-  "shop": "紫洋库存系统",
+  "shop": "库存系统",
   "gen": "上班猫桌宠"
 }
 ```
