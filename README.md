@@ -45,6 +45,35 @@
 - 不是自动注入。它不会在开场把内容塞进上下文——由你决定什么时候读。
 - 不是云端服务。所有文件都在本地。
 
+## 和同类工具比
+
+这个方向已经有不少项目。下表按“做法”分类，不是排名，星数是 2026 年 11 月的粗略值，
+这些项目迭代很快，具体能力以各自的 README 为准。
+
+| 项目 | 星 | 做法 | 和 SessionDigest 的关系 |
+|---|---:|---|---|
+| [claude-mem](https://github.com/thedotmack/claude-mem) | ~114k | Hook 自动捕获 → AI 压缩 → 下次会话自动注入，支持多个 agent | 最完整的方案。要“自动”，用它 |
+| [claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler) | ~1.3k | 会话结束 Hook → 每日日志 → 编译成概念化知识文章 | 比“一场一份摘要”更深一层，但依赖 Hook |
+| [deja-vu](https://github.com/vshulcz/deja-vu) | ~1.4k | 跨 43 种 agent 的本地会话纯检索 | 检索，不归纳。与本项目互补 |
+| [claude-code-log](https://github.com/daaain/claude-code-log) | ~1.3k | jsonl → 可读 HTML / Markdown（Codex 为 beta） | 转格式，不做摘要 |
+| [claude-code-transcripts](https://github.com/simonw/claude-code-transcripts) | ~1.7k | 把 transcript 发布成网页 | 展示，不做归纳 |
+| [claude-conversation-extractor](https://github.com/ZeroSumQuant/claude-conversation-extractor) | ~692 | 把对话提取成 markdown | 提取，不归纳 |
+| [claude-obsidian-sessions](https://github.com/plcosta/claude-obsidian-sessions) | — | Stop Hook → Haiku 摘要 → Obsidian 笔记 | 输出形态接近，但只支持 Claude、依赖 Bun |
+
+那为什么还写这个？四个理由：
+
+1. **零配置**。不装 Hook、不装运行时、不起后台进程、不改 Claude 配置。
+   clone 下来，一个 Python 文件跑完就退。
+2. **增量续写**。同一场会话继续聊，只摘要新增部分并追加「续」段，满 N 段再合并。
+   多数同类是“会话结束跑一次”，或每次整场重跑。
+3. **事实校验**。摘要里的路径、命令、报错会回原文比对，对不上的标 `⚠`。
+4. **你决定上下文何时进入**。不自动注入，用 `--context` 手动拼接。
+   这不是功能缺失，是取舍：不做悄悄消耗 token 的事。
+
+如果你要的是“装完就忘、自动带上下文”，用 claude-mem；
+要完整的可读归档，用 claude-code-log；要搜历史，用 deja-vu。
+它们和本项目可以同时装，不冲突。
+
 ## 四种模式
 
 | 模式 | 调用模型 | 输出 | 用途 |
@@ -251,8 +280,9 @@ python -m unittest discover -s tests -v
 **Claude Code 升级后格式变了怎么办？**
 解析失败不会崩溃，只会少解析内容。用 `--verbose` 看异常堆栈，然后提 issue 附上一段脱敏后的 jsonl。
 
-**和 claude-mem / claude-conversation-extractor 有什么区别？**
-SessionDigest 同时支持 Claude Code 和 Codex；零依赖、无后台进程；输出是给人和 AI 读的笔记，不是检索索引。它和检索型工具是互补关系，可以同时用。
+**和 claude-mem / claude-code-log 这些有什么区别？**
+见上文「和同类工具比」。简单说：它们多数靠 Hook 自动跑并注入上下文，
+本项目零配置、手动控制、带增量续写和事实校验，定位不同，可以同时用。
 
 **支持别的 agent 吗？**
 解析器在 `parse_claude` / `parse_codex` 里，加一个 `parse_xxx` 并接进 `parse_session` 即可。欢迎 PR，附一段样本格式。
