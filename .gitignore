@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 本地运行产物
+digest-output/
+memory_preview/
+*.log
+state.json
+state.json.tmp
+
+# 个人配置
+projects.json
+.env
