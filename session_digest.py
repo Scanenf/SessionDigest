@@ -1128,6 +1128,13 @@ def parse_incremental(path: str, kind: str, start_offset: int) -> Tuple[dict, in
     info = _blank_info(kind)
     handler = _parse_claude_line if kind == "claude" else _parse_codex_line
     with open(path, "rb") as f:
+        if start_offset > 0:
+            f.seek(start_offset - 1)
+            if f.read(1) != b"\n":
+                # 旧偏移量落在行中间：跳到下一行，最多丢一行残片，
+                # 不能把半行当完整记录解析。
+                skipped = f.readline()
+                start_offset += len(skipped)
         f.seek(start_offset)
         data = f.read()
 
@@ -1704,16 +1711,9 @@ def _parse_response(fmt: str, d: dict) -> Tuple[str, dict, bool]:
     return text, d.get("usage") or {}, d.get("stop_reason") == "max_tokens"
 
 
-def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 300):
-    if not cfg.api_key:
-        raise RuntimeError(
-            "缺少 API key：请设置 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY，"
-            "或传入 --api-key")
-    fmt = cfg.api_format if cfg.api_format in ("anthropic", "openai") else "anthropic"
-    if fmt == "openai" and not cfg.model:
-        raise RuntimeError(
-            "OpenAI 兼容模式需要指定模型：--model 或环境变量 OPENAI_MODEL")
-    url = api_endpoint(cfg)
+def _request_llm(cfg: Config, fmt: str, url: str, prompt: str,
+                 max_tokens: int, timeout: int):
+    """发一次请求；网络错误重试一次，返回 (text, usage, truncated)。"""
     last_err = None
     for net_attempt in range(2):
         body = json.dumps({
@@ -1758,14 +1758,37 @@ def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 30
                 f"模型端点返回的不是 JSON（当前按 {fmt} 格式请求 {url}）："
                 f"{raw[:200]}") from e
 
-        text, usage, truncated = _parse_response(fmt, d)
-        if text:
-            return text, usage
-        if truncated and max_tokens < 32000:
-            max_tokens *= 2
-            continue
-        raise RuntimeError(f"模型未返回文本（{fmt}）：{raw[:200]}")
+        return _parse_response(fmt, d)
     raise RuntimeError(f"请求失败：{last_err}")
+
+
+def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 300):
+    if not cfg.api_key:
+        raise RuntimeError(
+            "缺少 API key：请设置 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY，"
+            "或传入 --api-key")
+    fmt = cfg.api_format if cfg.api_format in ("anthropic", "openai") else "anthropic"
+    if fmt == "openai" and not cfg.model:
+        raise RuntimeError(
+            "OpenAI 兼容模式需要指定模型：--model 或环境变量 OPENAI_MODEL")
+    url = api_endpoint(cfg)
+
+    budget = max_tokens
+    expansions = 0
+    while True:
+        text, usage, truncated = _request_llm(
+            cfg, fmt, url, prompt, budget, timeout)
+        if not truncated:
+            if text:
+                return text, usage
+            raise RuntimeError(f"模型未返回文本（{fmt}）")
+        # 被截断的正文不能当成完整摘要写入；先扩容重试，到上限就报错。
+        if expansions >= 2 or budget >= 32000:
+            raise RuntimeError(
+                f"模型输出被截断，max_tokens={budget} 已达上限。"
+                "为避免写入不完整摘要，本次不保存，下一轮会重试。")
+        budget = min(budget * 2, 32000)
+        expansions += 1
 
 
 def summarize_one(cfg: Config, info: dict, label: str):
@@ -1795,19 +1818,33 @@ def strip_frontmatter(text: str) -> str:
     return text
 
 
+def _next_monthly_block(text: str, pos: int) -> int:
+    """找下一个真正的会话块标题，跳过摘要正文里的 `## 续` 等子标题。"""
+    i = pos
+    while True:
+        j = text.find("\n## ", i)
+        if j < 0:
+            return len(text)
+        window = text[j:j + 400]
+        dated = re.match(r"\n## \d{4}-\d{2}-\d{2}\b", window)
+        if dated and re.search(r"\nsession:\s*`", window):
+            return j
+        i = j + 1
+
+
 def find_monthly_block(text: str, sid: str) -> Optional[Tuple[int, int]]:
-    """定位 `session: \\`sid\\`` 所在的块，返回 [start, end)。"""
+    """定位 `session: \\`sid\\`` 所在的块，返回 [start, end)。
+
+    块尾以下一个会话块标题为准，而不是第一个 `---`：
+    合并后的摘要正文本身可能包含分隔线。
+    """
     marker = f"session: `{sid}`"
     i = text.find(marker)
     if i < 0:
         return None
     start = text.rfind("\n## ", 0, i)
     start = 0 if start < 0 else start + 1
-    end = text.find("\n---", i)
-    if end < 0:
-        end = len(text)
-    else:
-        end += len("\n---")
+    end = _next_monthly_block(text, i)
     return start, end
 
 
@@ -1840,7 +1877,10 @@ def insert_into_block(text: str, sid: str, addition: str) -> str:
     start, end = span
     block = text[start:end]
     body = re.sub(r"\n*---\s*$", "", block)
-    return text[:start] + body.rstrip() + "\n\n" + addition.strip() + "\n\n---" + text[end:]
+    tail = text[end:]
+    if tail and not tail.startswith("\n\n"):
+        tail = "\n" + tail
+    return text[:start] + body.rstrip() + "\n\n" + addition.strip() + "\n\n---" + tail
 
 
 def monthly_block(month: str, info: dict, label: str, text: str, sid: str) -> str:
@@ -1903,19 +1943,29 @@ def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Opti
     return path
 
 
+def continuation_marker(sid: str, new_offset: int) -> str:
+    return f"<!-- sd:cont key={sid} offset={int(new_offset)} -->"
+
+
 def append_continuation(cfg: Config, info: dict, label: str, text: str,
-                        sid: str, prev_summary: str) -> Optional[str]:
+                        sid: str, prev_summary: str,
+                        new_offset: int = 0) -> Optional[str]:
+    """追加续段；同一偏移量的续段只写一次，便于崩溃后安全重跑。"""
+    marker = continuation_marker(sid, new_offset)
+    body = marker + "\n\n" + text.strip()
+
     path = obsidian_path(cfg, info, sid)
     if path:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 cur = fh.read()
-            write_text_atomic(path, redact_text(
-                cur.rstrip("\n") + "\n\n" + text.strip() + "\n", cfg.redact))
+            if marker not in cur:
+                write_text_atomic(path, redact_text(
+                    cur.rstrip("\n") + "\n\n" + body + "\n", cfg.redact))
         else:
             # 文件丢失时，用旧摘要 + 续段重建
             write_text_atomic(path, redact_text(obsidian_doc(
-                info, label, prev_summary.rstrip() + "\n\n" + text, sid),
+                info, label, prev_summary.rstrip() + "\n\n" + body, sid),
                 cfg.redact))
 
     month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
@@ -1928,14 +1978,17 @@ def append_continuation(cfg: Config, info: dict, label: str, text: str,
                 cur = fh.read()
         except Exception:
             cur = f"# {month} 会话摘要\n\n> 自动生成。原文可在本地会话记录中检索。\n"
-        if find_monthly_block(cur, sid):
-            cur = insert_into_block(cur, sid, text)
+        if marker in cur:
+            pass
+        elif find_monthly_block(cur, sid):
+            cur = insert_into_block(cur, sid, body)
+            write_text_atomic(mpath, redact_text(cur, cfg.redact))
         else:
             cur = replace_block(
                 cur, sid,
                 monthly_block(month, info, label,
-                              prev_summary.rstrip() + "\n\n" + text, sid))
-        write_text_atomic(mpath, redact_text(cur, cfg.redact))
+                              prev_summary.rstrip() + "\n\n" + body, sid))
+            write_text_atomic(mpath, redact_text(cur, cfg.redact))
         update_memory_index(cfg, month)
     return path
 
@@ -1958,6 +2011,10 @@ def update_memory_index(cfg: Config, month: str) -> bool:
     return True
 
 
+def strip_continuation_markers(text: str) -> str:
+    return re.sub(r"<!--\s*sd:cont[^>]*-->\s*\n?", "", text or "")
+
+
 def find_previous_summary(cfg: Config, key: str) -> Optional[str]:
     """从已写入的 Obsidian 或月度文件里读回上一份摘要。"""
     if cfg.obsidian_dir:
@@ -1969,7 +2026,8 @@ def find_previous_summary(cfg: Config, key: str) -> Optional[str]:
             except Exception:
                 continue
             if f'session: "{key}"' in raw:
-                return strip_frontmatter(raw).strip()
+                return strip_continuation_markers(
+                    strip_frontmatter(raw)).strip()
     if cfg.memory_dir:
         for p in glob.glob(os.path.join(cfg.memory_dir, "sessions", "*.md")):
             try:
@@ -1979,8 +2037,149 @@ def find_previous_summary(cfg: Config, key: str) -> Optional[str]:
                 continue
             t = block_text(raw, key)
             if t:
-                return t
+                return strip_continuation_markers(t).strip()
     return None
+
+
+# ---------------------------------------------------------------------------
+# 结论代理与合并防丢
+# ---------------------------------------------------------------------------
+
+_DECISION_RE = re.compile(r"因为|由于|所以|决定|改为|不再|暂时|尚未|完成|采用|保留|放弃")
+_SUPERSEDED_RE = re.compile(r"改为|不再|此前|推翻|废弃|作废")
+_MAX_FACTS = 40
+
+
+def _summary_sections(text: str) -> List[Tuple[str, List[str]]]:
+    sections: List[Tuple[str, List[str]]] = []
+    cur_name = ""
+    cur_lines: List[str] = []
+
+    def flush():
+        if cur_name or cur_lines:
+            sections.append((cur_name, cur_lines))
+
+    for line in str(text or "").splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            flush()
+            cur_name = m.group(2).strip()
+            cur_lines = []
+        else:
+            cur_lines.append(line)
+    flush()
+    return sections
+
+
+def _fact_tokens(text: str) -> List[str]:
+    return sorted(text_tokens(text))
+
+
+def extract_conclusions(text: str, limit: int = _MAX_FACTS) -> List[dict]:
+    """把摘要里的标识符、待办和决策句抽成可比较的结论代理。
+
+    这是近似检查，不证明语义完全保留。
+    """
+    facts: List[dict] = []
+    for name, lines in _summary_sections(strip_frontmatter(text or "")):
+        body = "\n".join(lines)
+        if "关键标识符" in name:
+            for frag in re.findall(r"`([^`]+)`", body):
+                frag = frag.strip()
+                if len(frag) >= 4 and not frag.startswith("⚠"):
+                    facts.append({"type": "identifier", "text": frag,
+                                  "tokens": _fact_tokens(frag)})
+        if "还没完" in name or "待办" in name:
+            for line in lines:
+                s = re.sub(r"^\s*[-*]\s+", "", line).strip()
+                if s and s not in ("无", "暂无", "无。"):
+                    facts.append({"type": "todo", "text": s,
+                                  "tokens": _fact_tokens(s)})
+        if any(k in name for k in ("走过的路", "这一段", "修正了什么",
+                                   "新增了什么", "关键标识符")):
+            for sentence in re.split(r"(?<=[。！？；])", body):
+                s = sentence.strip()
+                if len(s) < 6 or not _DECISION_RE.search(s):
+                    continue
+                statement, reason = s, ""
+                m = re.search(r"(因为|由于)(.+)$", s)
+                if m:
+                    statement = s[:m.start()].strip(" ，,。；;")
+                    reason = m.group(2).strip(" 。；;")
+                facts.append({
+                    "type": "decision",
+                    "statement": statement,
+                    "reason": reason,
+                    "status": ("superseded"
+                               if _SUPERSEDED_RE.search(s) else "active"),
+                    "tokens": _fact_tokens(statement),
+                    "reason_tokens": _fact_tokens(reason),
+                })
+
+    seen = set()
+    out = []
+    for f in facts:
+        key = (f["type"], f.get("text") or f.get("statement"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out[:limit]
+
+
+def merge_fact_lists(*lists) -> List[dict]:
+    seen = set()
+    out: List[dict] = []
+    for lst in lists:
+        for f in lst or []:
+            if not isinstance(f, dict):
+                continue
+            key = (f.get("type"), f.get("text") or f.get("statement"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f)
+    return out[:_MAX_FACTS]
+
+
+def _coverage(need: List[str], have: set) -> float:
+    need_set = set(need or [])
+    if not need_set:
+        return 1.0
+    return len(need_set & have) / len(need_set)
+
+
+def merge_loss_check(old_facts: List[dict], merged: str) -> List[str]:
+    """返回合并后可能丢失的旧结论；空列表表示通过。"""
+    merged_text = str(merged or "")
+    merged_norm = _norm_match(merged_text)
+    merged_tokens = text_tokens(merged_text)
+    lost: List[str] = []
+    for f in old_facts or []:
+        if not isinstance(f, dict):
+            continue
+        typ = f.get("type")
+        if typ in ("identifier", "todo"):
+            text = str(f.get("text") or "")
+            needle = _norm_match(text)
+            if needle and needle in merged_norm:
+                continue
+            if typ == "todo" and _coverage(f.get("tokens"), merged_tokens) >= 0.6:
+                continue
+            lost.append(text)
+        elif typ == "decision":
+            statement = str(f.get("statement") or "")
+            if _coverage(f.get("tokens"), merged_tokens) < 0.6:
+                lost.append("结论：" + statement)
+                continue
+            if f.get("reason") and _coverage(f.get("reason_tokens"),
+                                             merged_tokens) < 0.5:
+                lost.append("原因：" + str(f.get("reason")))
+                continue
+            if f.get("status") == "superseded" \
+                    and not _SUPERSEDED_RE.search(merged_text):
+                lost.append("状态：" + statement)
+    return lost
 
 
 # ---------------------------------------------------------------------------
@@ -2434,6 +2633,8 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             text = checked_summary(cfg, text, info)
             write_full(cfg, info, task.label, text, sid)
             sections = 0
+            # state 里的结论代理同样要脱敏，不能绕过落盘前的隐私处理
+            facts = extract_conclusions(redact_text(text, cfg.redact))
             print(f"  全量 {nchars} 字符 -> in={usage.get('input_tokens')} "
                   f"out={usage.get('output_tokens')}")
 
@@ -2443,8 +2644,15 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             prompt = continuation_prompt(prev, info, delta, _today(info))
             text, usage = call_llm(cfg, prompt)
             text = checked_summary(cfg, text, info, prev)
-            append_continuation(cfg, info, task.label, text, sid, prev)
+            # 偏移量用调用前确定的边界：调用期间追加的行留给下一轮
+            append_continuation(cfg, info, task.label, text, sid, prev,
+                                task.new_offset)
             sections = task.sections + 1
+            old_facts = prev_entry.get("digest_facts") \
+                or extract_conclusions(prev)
+            facts = merge_fact_lists(
+                old_facts,
+                extract_conclusions(redact_text(text, cfg.redact)))
             print(f"  续写 {len(delta)} 字符 -> in={usage.get('input_tokens')} "
                   f"out={usage.get('output_tokens')}（第 {sections} 段）")
 
@@ -2452,19 +2660,39 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             prev = redact_text(task.prev_summary or "", cfg.redact)
             text, usage = call_llm(cfg, merge_prompt(prev))
             text = checked_summary(cfg, text, info)
+            old_facts = prev_entry.get("digest_facts") \
+                or extract_conclusions(prev)
+            safe_text = redact_text(text, cfg.redact)
+            lost = merge_loss_check(old_facts, safe_text)
+            if lost:
+                rejections = int(prev_entry.get("merge_rejections", 0)) + 1
+                prev_entry = dict(prev_entry)
+                prev_entry["merge_rejections"] = rejections
+                if rejections >= 3:
+                    prev_entry["sections"] = 0
+                    prev_entry["merge_rejections"] = 0
+                    state[sid] = prev_entry
+                    save_state(cfg, state)
+                    print("  合并连续 3 次会丢失旧结论，保留原摘要并跳过合并。",
+                          file=sys.stderr)
+                    clear_failure(cfg, sid)
+                    return True
+                state[sid] = prev_entry
+                save_state(cfg, state)
+                raise RuntimeError(
+                    "合并会丢失旧结论：" + "；".join(lost[:3]))
             write_full(cfg, info, task.label, text, sid)
             sections = 0
+            facts = extract_conclusions(safe_text)
             print(f"  合并 -> in={usage.get('input_tokens')} "
                   f"out={usage.get('output_tokens')}")
 
-        if task.mode in ("full", "merge"):
-            new_offset = os.path.getsize(task.path)
-        else:
-            new_offset = task.new_offset
+        # 先更新索引，再写 state（提交点）：state 写成功才代表这一轮完成。
+        update_index(cfg, info, task.label, text, sid, task.path, task.mode)
 
         state[sid] = {
-            "offset": new_offset,
-            "prefix_sha1": prefix_sha1(task.path, new_offset),
+            "offset": task.new_offset,
+            "prefix_sha1": prefix_sha1(task.path, task.new_offset),
             "sections": sections,
             "date": info.get("_first_date"),
             "first_date": info.get("_first_date"),
@@ -2474,10 +2702,11 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
                 cfg, task.path,
                 "claude" if task.kind == "claude" else "codex", sid=sid),
             "tokens": usage,
+            "digest_facts": facts,
+            "merge_rejections": 0,
             "done_at": datetime.now().isoformat(timespec="seconds"),
         }
         save_state(cfg, state)
-        update_index(cfg, info, task.label, text, sid, task.path, task.mode)
         clear_failure(cfg, sid)
         return True
 

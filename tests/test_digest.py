@@ -1759,5 +1759,326 @@ class TestCommandEventsParsing(unittest.TestCase):
             self.assertTrue(info["command_events"][0]["success_evidence"])
 
 
+FULL_SUMMARY = """## 这一段在做什么
+保留导出逻辑。
+
+## 走过的路
+决定保留 `/a/keep.py`，因为兼容旧客户端。
+
+## 关键标识符
+- 路径：`/a/keep.py`
+- 命令：`pytest tests -q`
+
+## 还没完的事
+- 大文件内存占用未测
+"""
+
+
+class TestIncrementalReliability(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_cfg(self.tmp)
+        os.makedirs(self.cfg.obsidian_dir, exist_ok=True)
+        os.makedirs(self.cfg.memory_dir, exist_ok=True)
+        self.cfg.min_delta_turns = 1
+        self.cfg.min_delta_chars = 1
+
+    def _seed(self, sid="sid-inc", pairs=3, start_minute=0):
+        path = os.path.join(self.cfg.claude_root, "proj", f"{sid}.jsonl")
+        write_jsonl(path, claude_lines(sid, pairs, start_minute=start_minute))
+        return path
+
+    def _append(self, path, sid, pairs=3, start_minute=10):
+        with open(path, "a", encoding="utf-8") as f:
+            for r in claude_lines(sid, pairs, start_minute=start_minute):
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    def _state_for(self, path, sid, offset, sections=0):
+        return {sid: {"offset": offset,
+                      "prefix_sha1": sd.prefix_sha1(path, offset),
+                      "sections": sections}}
+
+    def _full(self, path, sid, summary=FULL_SUMMARY, state=None):
+        info = sd.parse_session(path, "claude")
+        task = sd.Task(info=info, label="shop", kind="claude", path=path,
+                       key=sid, mode="full", start_offset=0,
+                       new_offset=os.path.getsize(path))
+        state = state if state is not None else {}
+        with mock.patch.object(
+                sd, "call_llm",
+                return_value=(summary, {"input_tokens": 1, "output_tokens": 1})):
+            ok = sd.execute_task(self.cfg, task, state)
+        self.assertTrue(ok)
+        return state
+
+    def _doc(self, sid):
+        path = sd.obsidian_path(self.cfg, {"start": "2026-11-01 10:00"}, sid)
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_crash_after_write_does_not_duplicate_continuation(self):
+        sid = "sid-crash"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        offset = os.path.getsize(path)
+        self._append(path, sid)
+        tasks, _ = sd.plan_nightly(self.cfg, state)
+        self.assertEqual(tasks[0].mode, "incremental")
+        same_offset = tasks[0].new_offset
+
+        calls = {"n": 0}
+        real_save = sd.save_state
+
+        def flaky(cfg, st):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError("crash before state")
+            real_save(cfg, st)
+
+        with mock.patch.object(
+                sd, "call_llm",
+                side_effect=[("## 续 · 一\n\n第一次", {"output_tokens": 1}),
+                             ("## 续 · 二\n\n第二次", {"output_tokens": 1})]), \
+                mock.patch.object(sd, "save_state", side_effect=flaky):
+            self.assertFalse(sd.execute_task(self.cfg, tasks[0], state))
+
+        # 重跑：offset 相同，续段标记已存在，不能再追加一段
+        state2 = sd.load_state(self.cfg)
+        tasks2, _ = sd.plan_nightly(self.cfg, state2)
+        self.assertEqual(tasks2[0].new_offset, same_offset)
+        with mock.patch.object(
+                sd, "call_llm",
+                return_value=("## 续 · 二\n\n第二次", {"output_tokens": 1})):
+            self.assertTrue(sd.execute_task(self.cfg, tasks2[0], state2))
+
+        doc = self._doc(sid)
+        self.assertEqual(doc.count("<!-- sd:cont key="), 1)
+        self.assertEqual(doc.count("## 续"), 1)
+        self.assertEqual(sd.load_state(self.cfg)[sid]["sections"], 1)
+
+    def test_three_appends_then_merge(self):
+        sid = "sid-multi"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        last_offset = state[sid]["offset"]
+        for i in range(3):
+            self._append(path, sid, start_minute=10 + i * 10)
+            tasks, _ = sd.plan_nightly(self.cfg, state)
+            self.assertEqual(tasks[0].mode, "incremental")
+            self._run_incremental(tasks[0], state, f"## 续 · {i}\n\n第 {i} 段")
+            self.assertGreater(state[sid]["offset"], last_offset)
+            last_offset = state[sid]["offset"]
+
+        doc = self._doc(sid)
+        self.assertEqual(doc.count("## 续"), 3)
+        self.assertIn("/a/keep.py", doc)          # 旧事实仍在
+        self.assertEqual(state[sid]["sections"], 3)
+        prev = sd.find_previous_summary(self.cfg, sid)
+        self.assertNotIn("sd:cont", prev)
+
+        tasks, _ = sd.plan_nightly(self.cfg, state)
+        self.assertEqual(tasks[0].mode, "merge")
+
+    def _run_incremental(self, task, state, text):
+        with mock.patch.object(
+                sd, "call_llm",
+                return_value=(text, {"input_tokens": 1, "output_tokens": 1})):
+            return sd.execute_task(self.cfg, task, state)
+
+    def test_truncation_does_not_advance_offset(self):
+        sid = "sid-trunc"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        old_offset = state[sid]["offset"]
+        self._append(path, sid)
+        tasks, _ = sd.plan_nightly(self.cfg, state)
+        task = tasks[0]
+        doc_path = sd.obsidian_path(self.cfg, {"start": "2026-11-01 10:00"},
+                                    sid)
+        with open(doc_path, "rb") as f:
+            before = f.read()
+        with mock.patch.object(
+                sd, "call_llm",
+                side_effect=RuntimeError("模型输出被截断，max_tokens 已达上限")):
+            self.assertFalse(sd.execute_task(self.cfg, task, state))
+        self.assertEqual(state[sid]["offset"], old_offset)
+        with open(doc_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        fails = sd.load_failures(self.cfg)
+        self.assertEqual(fails[sid]["attempts"], 1)
+
+        tasks2, _ = sd.plan_nightly(self.cfg, sd.load_state(self.cfg))
+        self.assertEqual(tasks2[0].mode, "incremental")
+        self.assertEqual(tasks2[0].start_offset, old_offset)
+
+    def test_merge_error_leaves_file_and_sections_unchanged(self):
+        sid = "sid-merge-err"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        state[sid]["sections"] = 3
+        doc_path = sd.obsidian_path(self.cfg, {"start": "2026-11-01 10:00"},
+                                    sid)
+        with open(doc_path, "rb") as f:
+            before = f.read()
+        task = sd.Task(info=sd.parse_session(path, "claude"), label="shop",
+                       kind="claude", path=path, key=sid, mode="merge",
+                       start_offset=state[sid]["offset"],
+                       new_offset=state[sid]["offset"],
+                       prev_summary=sd.find_previous_summary(self.cfg, sid),
+                       sections=3)
+        with mock.patch.object(sd, "call_llm",
+                               side_effect=RuntimeError("endpoint down")):
+            self.assertFalse(sd.execute_task(self.cfg, task, state))
+        with open(doc_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(state[sid]["sections"], 3)
+
+    def test_merge_rejects_conclusion_loss_three_times(self):
+        sid = "sid-merge-loss"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        state[sid]["sections"] = 3
+        sd.save_state(self.cfg, state)
+        doc_path = sd.obsidian_path(self.cfg, {"start": "2026-11-01 10:00"},
+                                    sid)
+        with open(doc_path, "rb") as f:
+            before = f.read()
+
+        lossy = ("## 这一段在做什么\n保留了导出逻辑。\n\n"
+                 "## 走过的路\n做了一些调整。\n\n"
+                 "## 关键标识符\n- 路径：`/a/other.py`\n\n"
+                 "## 还没完的事\n- 大文件内存占用未测\n")
+
+        for attempt in range(3):
+            st = sd.load_state(self.cfg)
+            task = sd.Task(info=sd.parse_session(path, "claude"), label="shop",
+                           kind="claude", path=path, key=sid, mode="merge",
+                           start_offset=st[sid]["offset"],
+                           new_offset=st[sid]["offset"],
+                           prev_summary=sd.find_previous_summary(self.cfg, sid),
+                           sections=int(st[sid].get("sections", 0)))
+            with mock.patch.object(
+                    sd, "call_llm",
+                    return_value=(lossy, {"output_tokens": 1})):
+                ok = sd.execute_task(self.cfg, task, st)
+            with open(doc_path, "rb") as f:
+                self.assertEqual(f.read(), before)
+            if attempt < 2:
+                self.assertFalse(ok)
+                self.assertIn("/a/keep.py",
+                              sd.load_failures(self.cfg)[sid]["error"])
+            else:
+                self.assertTrue(ok)
+
+        final = sd.load_state(self.cfg)[sid]
+        self.assertEqual(final["sections"], 0)
+        self.assertEqual(final.get("merge_rejections", 0), 0)
+
+    def test_lines_appended_during_call_are_processed_next_round(self):
+        sid = "sid-append"
+        path = self._seed(sid)
+        state = self._full(path, sid)
+        self._append(path, sid)
+        tasks, _ = sd.plan_nightly(self.cfg, state)
+        task = tasks[0]
+        pre_call = os.path.getsize(path)
+
+        def llm(cfg, prompt):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"type": "user", "sessionId": sid,
+                     "message": {"role": "user",
+                                 "content": [{"type": "text",
+                                              "text": "调用期间新增"}]}},
+                    ensure_ascii=False) + "\n")
+            return "## 续 · 调用期间", {"output_tokens": 1}
+
+        with mock.patch.object(sd, "call_llm", side_effect=llm):
+            self.assertTrue(sd.execute_task(self.cfg, task, state))
+        self.assertEqual(state[sid]["offset"], pre_call)
+        tasks2, _ = sd.plan_nightly(self.cfg, state)
+        self.assertEqual(tasks2[0].mode, "incremental")
+        self.assertEqual(tasks2[0].start_offset, pre_call)
+
+    def test_offset_inside_a_line_is_aligned_forward(self):
+        sid = "sid-align"
+        path = self._seed(sid, pairs=3)
+        with open(path, "rb") as f:
+            lines = f.read().split(b"\n")
+        offset = len(lines[0]) + 1 + 5      # 第一条换行后、第二条中间
+        info, new_offset = sd.parse_incremental(path, "claude", offset)
+        self.assertEqual(new_offset, os.path.getsize(path))
+        self.assertEqual(info["turns"], 4)  # 丢掉残行，后 4 条完整记录
+        self.assertEqual(len(info["prompts"]), 2)
+
+    def test_digest_facts_do_not_store_raw_secrets(self):
+        sid = "sid-secret"
+        path = self._seed(sid)
+        summary = ("## 关键标识符\n"
+                   "- token：`sk-ant-api03-abcdefghijklmnop`\n\n"
+                   "## 还没完的事\n- 无\n")
+        self._full(path, sid, summary=summary)
+        with open(self.cfg.state_file, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertNotIn("sk-ant-api03", raw)
+
+    def test_merge_text_with_hr_and_heading_does_not_split_block(self):
+        sid_a, sid_b = "sid-block-a", "sid-block-b"
+        info_a = sd._blank_info("claude")
+        info_a.update({"session": sid_a, "start": "2026-11-01 10:00",
+                       "turns": 4, "prompts": ["A"]})
+        info_b = sd._blank_info("claude")
+        info_b.update({"session": sid_b, "start": "2026-11-01 11:00",
+                       "turns": 4, "prompts": ["B"]})
+        sd.write_full(self.cfg, info_a, "shopA", "old A", sid_a)
+        sd.write_full(self.cfg, info_b, "shopB", "old B", sid_b)
+        merged = "## 这一段在做什么\n混排。\n\n---\n\n## 续 · 2026-11-02\n新段。"
+        sd.write_full(self.cfg, info_a, "shopA", merged, sid_a)
+
+        mpath = os.path.join(self.cfg.memory_dir, "sessions", "2026-11.md")
+        with open(mpath, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertEqual(raw.count("session: `"), 2)
+        self.assertIn("old B", raw)
+        span = sd.find_monthly_block(raw, sid_a)
+        self.assertIsNotNone(span)
+        block = raw[span[0]:span[1]]
+        self.assertIn("## 续 · 2026-11-02", block)
+        self.assertIn("---", block)
+
+
+class TestLLMTruncation(unittest.TestCase):
+    def _cfg(self, tmp):
+        cfg = make_cfg(tmp)
+        cfg.api_format = "anthropic"
+        cfg.model = "test-model"
+        return cfg
+
+    def test_nonempty_truncated_is_not_accepted(self):
+        partial = {"content": [{"type": "text", "text": "半截摘要"}],
+                   "usage": {}, "stop_reason": "max_tokens"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(200, partial), (200, ANTHROPIC_OK)]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            text, _ = sd.call_llm(cfg, "写摘要", max_tokens=100)
+            self.assertEqual(text, "摘要正文")
+            self.assertEqual([r["body"]["max_tokens"] for r in srv.requests],
+                             [100, 200])
+
+    def test_truncated_at_cap_raises(self):
+        partial = {"content": [{"type": "text", "text": "半截摘要"}],
+                   "usage": {}, "stop_reason": "max_tokens"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(200, partial)]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            with self.assertRaises(RuntimeError) as cm:
+                sd.call_llm(cfg, "写摘要", max_tokens=32000)
+            self.assertIn("截断", str(cm.exception))
+            self.assertEqual(len(srv.requests), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
