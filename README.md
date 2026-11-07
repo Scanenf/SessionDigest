@@ -45,13 +45,37 @@
 - 不是自动注入。它不会在开场把内容塞进上下文——由你决定什么时候读。
 - 不是云端服务。所有文件都在本地。
 
-## 三种模式
+## 四种模式
 
 | 模式 | 调用模型 | 输出 | 用途 |
 |---|---|---|---|
 | `--export` | 否 | 按项目分组的会话摘录 + 索引 | 先看看库里有什么 |
 | `--llm N` | 是 | 临时目录里的 N 份摘要 | 试效果、调 prompt |
-| `--nightly` | 是 | `memory/` 与 Obsidian，增量去重 | 挂定时任务长期跑 |
+| `--nightly` | 是 | `memory/` 与 Obsidian，增量续写 | 挂定时任务长期跑 |
+| `--context N` | 否 | 最近 N 份摘要的拼接文本 | 手动喂给下一次会话 |
+
+## 增量续写
+
+同一场会话继续聊时，不会整场重跑：
+
+1. state 里记录上次处理到的**字节偏移量**和前缀哈希
+2. 下次夜间任务只读新增部分，生成一段「## 续 · 时间」
+3. 续段追加到同一份摘要末尾，不新建文件
+4. 续段累计到 `--merge-after` 次（默认 3），自动做一次合并整理，压回一份完整摘要
+
+新增内容太少（默认少于 4 条消息且不足 500 字符）就跳过，等下次一起处理。
+会话文件被重写、前缀哈希对不上时，回退为整场重跑。
+
+## 事实校验
+
+摘要生成后，程序会把「关键标识符」里反引号包裹的路径、命令、报错拿回原文做匹配。
+原文里找不到的条目会被标上 `⚠`：
+
+```markdown
+- 路径：`app/export.py`、`app/missing.py` ⚠
+```
+
+这不能消灭幻觉，但能让你一眼看出哪些条目需要核对。用 `--no-verify` 关闭校验。
 
 ## 安装
 
@@ -67,7 +91,7 @@ set ANTHROPIC_AUTH_TOKEN=sk-ant-...           # Windows cmd
 ```
 
 也支持 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL`。
-没有设置时，会尝试读取 `~/.claude/settings.json` 里的 `env` 块（这是 Claude Code 用户的常见配置位置）。
+没有设置时，会尝试读取 `~/.claude/settings.json` 里的 `env` 块。
 
 ## 快速开始
 
@@ -81,10 +105,13 @@ python session_digest.py --llm 5 --dry-run
 # 3. 真的生成 5 份摘要，输出到 digest-output/
 python session_digest.py --llm 5
 
-# 4. 正式跑：写入 Obsidian，增量处理新会话
+# 4. 正式跑：写入 Obsidian，增量处理新会话和续写部分
 python session_digest.py --nightly \
   --obsidian-dir ~/vault/AI摘要 \
   --memory-dir ~/.claude/projects/<项目>/memory
+
+# 5. 把最近 5 份摘要拼起来，直接粘贴给 AI
+python session_digest.py --context 5 --project shop
 ```
 
 `--nightly` 至少需要 `--obsidian-dir` 或 `--memory-dir` 之一。
@@ -98,13 +125,21 @@ python session_digest.py --nightly \
 | `--out` | `digest-output` | `--export` / `--llm` 的输出目录 |
 | `--obsidian-dir` | 无 | Obsidian 摘要根目录，给了才写 |
 | `--memory-dir` | 无 | 写入 `sessions/YYYY-MM.md` 并维护 `MEMORY.md` |
-| `--state-file` | `~/.claude-session-digest/state.json` | 去重状态 |
+| `--state-file` | `~/.claude-session-digest/state.json` | 偏移量与去重状态 |
+| `--index-file` | 与 state 同目录 | 会话索引，供 `--context` 使用 |
+| `--failures-file` | 与 state 同目录 | 失败队列 |
 | `--projects-file` | 无 | 项目名映射，见下 |
+| `--project` | 无 | `--context` 时按项目名过滤 |
 | `--base-url` / `--api-key` / `--model` | 环境变量 | 模型配置 |
-| `--min-turns` | 8 | 少于 N 条消息的会话跳过 |
+| `--min-turns` | 8 | 新会话少于 N 条消息时跳过 |
 | `--min-age-hours` | 6 | 刚结束的会话先不动 |
 | `--max-sessions` | 20 | 单次上限，控制花费 |
-| `--force` | 关 | 忽略去重，重跑全部 |
+| `--merge-after` | 3 | 续段达到 N 段后合并整理 |
+| `--min-delta-turns` | 4 | 新增少于 N 条消息且字数不足时跳过 |
+| `--min-delta-chars` | 500 | 新增少于 N 字符且消息不足时跳过 |
+| `--force` | 关 | 忽略状态，全部重跑 |
+| `--no-verify` | 关 | 不把标识符与原文比对，不加 `⚠` |
+| `--retry-failed` | 关 | 只重试失败队列 |
 | `--dry-run` | 关 | 只规划、估算，不调用模型不写文件 |
 | `--verbose` | 关 | 失败时打印完整堆栈 |
 
@@ -122,11 +157,19 @@ Claude Code 的目录名是路径编码（如 `c--Users-me-projects-shop`），�
 }
 ```
 
+未匹配的项目会自动使用工作目录名。
+
+## 失败队列
+
+调用失败的会话会写进 `failures.json`，不推进偏移量。下次 `--nightly` 会先自动重试，
+也可以单独跑：
+
 ```bash
-python session_digest.py --nightly --projects-file projects.json --obsidian-dir ...
+python session_digest.py --retry-failed --dry-run   # 看看有哪些
+python session_digest.py --retry-failed             # 逐个重试
 ```
 
-未匹配的项目会自动使用工作目录名。
+同一项连续失败 3 次后不再自动重试，避免死循环。
 
 ## 定时任务
 
@@ -141,7 +184,7 @@ set SCRIPT_DIR=%~dp0
 python "%SCRIPT_DIR%session_digest.py" --nightly --obsidian-dir D:\vault\AI摘要 %*
 ```
 
-任务计划程序 → 新建任务 → 每天凌晨执行，起始于脚本目录。日志用 `>> nightly.log 2>&1` 追加。
+任务计划程序 → 新建任务 → 每天凌晨执行，起始于脚本目录。
 
 ### macOS / Linux
 
@@ -173,23 +216,37 @@ digest-output/                    # --export / --llm
 
 <obsidian-dir>/                   # --nightly
 └── 2026-11/
-    └── 2026-11-07_1a2b3c4d.md   # 带 frontmatter，可被 Dataview 查询
+    └── 2026-11-01_1a2b3c4d.md   # 续段追加在同一文件末尾
 
 <memory-dir>/                     # --nightly
-├── sessions/2026-11.md           # 按月追加
+├── sessions/2026-11.md           # 按月追加，同一会话重写块
 └── MEMORY.md                     # 自动插入一行索引
 ```
+
+## 从 v0.1 升级
+
+v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏移量，**不重跑历史**。
+升级前已经续写过的部分会漏掉；如果需要，用 `--force` 整场重跑一次。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+20 个用例覆盖两个解析器、增量读取、前缀哈希、事实校验（含 `--no-verify`）、
+月度块替换、规划判定、索引、失败队列和 `--context` 过滤。
 
 ## 常见问题
 
 **摘要会不会写错？**
-会。它是模型归纳的，不是程序抽取的。路径、命令、报错原文在 prompt 里要求逐字抄录，但叙述部分仍可能有偏差。把它当作“带方向的索引”，关键事实以原文为准。
+会。它是模型归纳的，不是程序抽取的。路径、命令、报错原文在 prompt 里要求逐字抄录，但叙述部分仍可能有偏差；标 `⚠` 的条目是程序没能在原文里匹配到的，优先核对它们。关键事实以原文为准。
 
 **会花多少钱？**
-取决于会话长度和模型。先用 `--dry-run` 看估算。一场典型会话的摘要在 1–2k output token 左右。`--max-sessions` 是硬上限。
+取决于会话长度和模型。先用 `--dry-run` 看估算。一场典型会话的摘要在 1–2k output token 左右。`--max-sessions` 是硬上限。增量续写只花新增部分的钱。
 
-**去重怎么算的？**
-按 session id（或文件名）记录在 `state.json` 里。删除该文件等于全部重跑。`--force` 可以临时忽略。会话文件被追加更新后不会自动重跑——需要 `--force` 或删掉对应条目。
+**同一场会话继续聊会怎样？**
+只摘要新增部分，追加「续」段，不重跑整场。见上文「增量续写」。
 
 **Claude Code 升级后格式变了怎么办？**
 解析失败不会崩溃，只会少解析内容。用 `--verbose` 看异常堆栈，然后提 issue 附上一段脱敏后的 jsonl。
@@ -198,7 +255,7 @@ digest-output/                    # --export / --llm
 SessionDigest 同时支持 Claude Code 和 Codex；零依赖、无后台进程；输出是给人和 AI 读的笔记，不是检索索引。它和检索型工具是互补关系，可以同时用。
 
 **支持别的 agent 吗？**
-解析器在 `parse_claude` / `parse_codex` 两个函数里，加一个 `parse_xxx` 并接进 `parse_session` 即可。欢迎 PR，附一段样本格式。
+解析器在 `parse_claude` / `parse_codex` 里，加一个 `parse_xxx` 并接进 `parse_session` 即可。欢迎 PR，附一段样本格式。
 
 ## License
 

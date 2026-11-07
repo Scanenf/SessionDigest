@@ -10,6 +10,10 @@ memory_preview/
 *.log
 state.json
 state.json.tmp
+index.json
+index.json.tmp
+failures.json
+failures.json.tmp
 
 # 个人配置
 projects.json

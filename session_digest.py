@@ -3,10 +3,12 @@
 """
 SessionDigest — 把 Claude Code / Codex 的本地会话记录蒸馏成结构化 Markdown 摘要。
 
-三种模式：
-  --export     全量导出，不调用模型，生成可浏览的会话索引
-  --llm N      预览：对最近 N 场会话生成摘要，写到临时目录
-  --nightly    正式：增量提炼新会话，写入 memory/ 和 Obsidian
+模式：
+  --export        全量导出，不调用模型
+  --llm N         预览：对最近 N 场会话生成摘要
+  --nightly       增量：新会话全量摘要，旧会话只摘要新增部分并追加「续」段
+  --context N     输出最近 N 份摘要拼接文本
+  --retry-failed  只重试失败队列
 
 隐私提示：
   本程序会读取本机会话记录，并把会话内容发送到你配置的模型端点。
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -29,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +47,8 @@ class Config:
     obsidian_dir: Optional[str]
     memory_dir: Optional[str]
     state_file: str
+    index_file: str
+    failures_file: str
     projects: Dict[str, str]
     base_url: str
     api_key: Optional[str]
@@ -51,16 +56,37 @@ class Config:
     min_turns: int = 8
     min_age_hours: int = 6
     max_sessions: int = 20
+    merge_after: int = 3
+    min_delta_turns: int = 4
+    min_delta_chars: int = 500
     force: bool = False
+    verify: bool = True
     verbose: bool = False
+
+
+@dataclass
+class Task:
+    info: dict
+    label: str
+    kind: str
+    path: str
+    key: str
+    mode: str                      # full | incremental | merge
+    start_offset: int = 0
+    new_offset: int = 0
+    prev_summary: Optional[str] = None
+    sections: int = 0
 
 
 def _expand(p: Optional[str]) -> Optional[str]:
     return os.path.expanduser(p) if p else p
 
 
+def _state_dir(cfg: Config) -> str:
+    return os.path.dirname(cfg.state_file) or "."
+
+
 def load_projects(path: Optional[str]) -> Dict[str, str]:
-    """可选的项目名映射：{"目录名或 cwd 名": "展示名"}。"""
     if not path:
         return {}
     try:
@@ -73,7 +99,6 @@ def load_projects(path: Optional[str]) -> Dict[str, str]:
 
 
 def resolve_llm(args) -> Tuple[str, Optional[str], str]:
-    """命令行 > 环境变量 > ~/.claude/settings.json 的 env 块 > 默认值。"""
     base = args.base_url or os.environ.get("ANTHROPIC_BASE_URL")
     tok = (args.api_key
            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
@@ -167,6 +192,120 @@ def _fmt_ts(ts) -> Optional[str]:
         return str(ts)[:16].replace("T", " ")
 
 
+def _parse_claude_line(e: dict, info: dict) -> None:
+    ts = _fmt_ts(e.get("timestamp"))
+    if ts:
+        if info["start"] is None:
+            info["start"] = ts
+        info["end"] = ts
+
+    typ = e.get("type")
+    if not typ or typ == "summary":
+        return
+    msg = e.get("message") or {}
+    role = msg.get("role")
+
+    if typ == "user" and role == "user":
+        info["turns"] += 1
+        text_parts = []
+        has_tool_result = False
+        for kind, data in walk_blocks(msg.get("content")):
+            if kind == "text":
+                text_parts.append(data)
+            elif kind == "tool_result":
+                has_tool_result = True
+                c = data.get("content")
+                got = []
+                if isinstance(c, list):
+                    got = [tval(cb) for cb in c]
+                elif isinstance(c, str):
+                    got.append(c)
+                text_parts.extend(got)
+                res = " ".join(x for x in got if x.strip())
+                if res and len(info["tool_results"]) < 40:
+                    info["tool_results"].append(trunc(res, 400))
+        joined = " ".join(p for p in text_parts if p.strip())
+        if not has_tool_result:
+            p = clean_prompt(joined)
+            if p:
+                info["prompts"].append(p)
+
+    elif typ == "assistant":
+        info["turns"] += 1
+        text_parts = []
+        for kind, data in walk_blocks(msg.get("content")):
+            if kind == "text":
+                text_parts.append(data)
+            elif kind == "tool_use":
+                name = data.get("name", "?")
+                info["tools"][name] += 1
+                inp = data.get("input") or {}
+                if not isinstance(inp, dict):
+                    continue
+                cmd = inp.get("command")
+                if cmd and len(info["commands"]) < 60:
+                    info["commands"].append(trunc(cmd, 300))
+                fp = inp.get("file_path") or inp.get("pattern")
+                if fp:
+                    key = str(fp)
+                    info["files"].setdefault(key, None)
+                    if name in ("Edit", "Write", "NotebookEdit") \
+                            and key not in info["modified"]:
+                        info["modified"].append(key)
+        t = " ".join(x for x in text_parts if x.strip()).strip()
+        if t:
+            info["assistant"].append(t)
+
+    if e.get("cwd"):
+        info["cwd"] = e["cwd"]
+    if e.get("gitBranch"):
+        info["branch"] = e["gitBranch"]
+    if e.get("sessionId"):
+        info["session"] = e["sessionId"]
+
+
+def _parse_codex_line(e: dict, info: dict) -> None:
+    ts = _fmt_ts(e.get("timestamp"))
+    if ts:
+        if info["start"] is None:
+            info["start"] = ts
+        info["end"] = ts
+
+    p = e.get("payload") or {}
+    pt = p.get("type") or e.get("type")
+    if pt in ("session_meta", "task_started", "turn_started"):
+        info["session"] = p.get("session_id") or info["session"]
+        if p.get("cwd"):
+            info["cwd"] = p["cwd"]
+        return
+
+    if pt == "user_message":
+        info["turns"] += 1
+        m = p.get("message")
+        if isinstance(m, str):
+            info["prompts"].append(m)
+        elif isinstance(m, dict):
+            c = m.get("content")
+            if isinstance(c, str):
+                info["prompts"].append(c)
+    elif pt == "agent_message":
+        info["turns"] += 1
+        m = p.get("message")
+        if isinstance(m, str):
+            info["assistant"].append(m)
+    elif pt in ("function_call", "custom_tool_call", "web_search_call"):
+        name = p.get("name") or pt
+        info["tools"][name] += 1
+        args = p.get("arguments") or p.get("input") or p.get("command") or ""
+        if isinstance(args, dict):
+            cmd = args.get("command") or args.get("cmd")
+            if cmd and len(info["commands"]) < 60:
+                info["commands"].append(trunc(cmd, 300))
+            fp = args.get("file_path") or args.get("pattern")
+            if fp:
+                info["files"].setdefault(str(fp), None)
+
+
 def parse_claude(path: str) -> dict:
     info = _blank_info("claude")
     try:
@@ -176,74 +315,7 @@ def parse_claude(path: str) -> dict:
                     e = json.loads(line)
                 except Exception:
                     continue
-                ts = _fmt_ts(e.get("timestamp"))
-                if ts:
-                    if info["start"] is None:
-                        info["start"] = ts
-                    info["end"] = ts
-                typ = e.get("type")
-                if not typ or typ == "summary":
-                    continue
-                msg = e.get("message") or {}
-                role = msg.get("role")
-
-                if typ == "user" and role == "user":
-                    info["turns"] += 1
-                    text_parts = []
-                    has_tool_result = False
-                    for kind, data in walk_blocks(msg.get("content")):
-                        if kind == "text":
-                            text_parts.append(data)
-                        elif kind == "tool_result":
-                            has_tool_result = True
-                            c = data.get("content")
-                            got = []
-                            if isinstance(c, list):
-                                got = [tval(cb) for cb in c]
-                            elif isinstance(c, str):
-                                got.append(c)
-                            text_parts.extend(got)
-                            res = " ".join(x for x in got if x.strip())
-                            if res and len(info["tool_results"]) < 40:
-                                info["tool_results"].append(trunc(res, 400))
-                    joined = " ".join(p for p in text_parts if p.strip())
-                    if not has_tool_result:
-                        p = clean_prompt(joined)
-                        if p:
-                            info["prompts"].append(p)
-
-                elif typ == "assistant":
-                    info["turns"] += 1
-                    text_parts = []
-                    for kind, data in walk_blocks(msg.get("content")):
-                        if kind == "text":
-                            text_parts.append(data)
-                        elif kind == "tool_use":
-                            name = data.get("name", "?")
-                            info["tools"][name] += 1
-                            inp = data.get("input") or {}
-                            if not isinstance(inp, dict):
-                                continue
-                            cmd = inp.get("command")
-                            if cmd and len(info["commands"]) < 60:
-                                info["commands"].append(trunc(cmd, 300))
-                            fp = inp.get("file_path") or inp.get("pattern")
-                            if fp:
-                                key = str(fp)
-                                info["files"].setdefault(key, None)
-                                if name in ("Edit", "Write", "NotebookEdit") \
-                                        and key not in info["modified"]:
-                                    info["modified"].append(key)
-                    t = " ".join(x for x in text_parts if x.strip()).strip()
-                    if t:
-                        info["assistant"].append(t)
-
-                if e.get("cwd"):
-                    info["cwd"] = e["cwd"]
-                if e.get("gitBranch"):
-                    info["branch"] = e["gitBranch"]
-                if e.get("sessionId"):
-                    info["session"] = e["sessionId"]
+                _parse_claude_line(e, info)
     except Exception as ex:
         info["error"] = str(ex)
     return info
@@ -258,45 +330,7 @@ def parse_codex(path: str) -> dict:
                     e = json.loads(line)
                 except Exception:
                     continue
-                ts = _fmt_ts(e.get("timestamp"))
-                if ts:
-                    if info["start"] is None:
-                        info["start"] = ts
-                    info["end"] = ts
-
-                p = e.get("payload") or {}
-                pt = p.get("type") or e.get("type")
-                if pt in ("session_meta", "task_started", "turn_started"):
-                    info["session"] = p.get("session_id") or info["session"]
-                    if p.get("cwd"):
-                        info["cwd"] = p["cwd"]
-                    continue
-
-                if pt == "user_message":
-                    info["turns"] += 1
-                    m = p.get("message")
-                    if isinstance(m, str):
-                        info["prompts"].append(m)
-                    elif isinstance(m, dict):
-                        c = m.get("content")
-                        if isinstance(c, str):
-                            info["prompts"].append(c)
-                elif pt == "agent_message":
-                    info["turns"] += 1
-                    m = p.get("message")
-                    if isinstance(m, str):
-                        info["assistant"].append(m)
-                elif pt in ("function_call", "custom_tool_call", "web_search_call"):
-                    name = p.get("name") or pt
-                    info["tools"][name] += 1
-                    args = p.get("arguments") or p.get("input") or p.get("command") or ""
-                    if isinstance(args, dict):
-                        cmd = args.get("command") or args.get("cmd")
-                        if cmd and len(info["commands"]) < 60:
-                            info["commands"].append(trunc(cmd, 300))
-                        fp = args.get("file_path") or args.get("pattern")
-                        if fp:
-                            info["files"].setdefault(str(fp), None)
+                _parse_codex_line(e, info)
     except Exception as ex:
         info["error"] = str(ex)
     return info
@@ -306,16 +340,133 @@ def parse_session(path: str, kind: str) -> dict:
     return parse_claude(path) if kind == "claude" else parse_codex(path)
 
 
-# ---------------------------------------------------------------------------
-# 项目名与文件扫描
-# ---------------------------------------------------------------------------
+def parse_incremental(path: str, kind: str, start_offset: int) -> Tuple[dict, int]:
+    """只解析 start_offset 之后的完整行，返回 (info, 新的偏移量)。"""
+    info = _blank_info(kind)
+    handler = _parse_claude_line if kind == "claude" else _parse_codex_line
+    with open(path, "rb") as f:
+        f.seek(start_offset)
+        data = f.read()
+
+    chunks = data.split(b"\n")
+    complete = chunks[:-1]          # 最后一段没有换行，可能是写了一半的行
+    consumed = sum(len(c) + 1 for c in complete)
+
+    for raw in complete:
+        line = raw.decode("utf-8", "replace").rstrip("\r")
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        handler(e, info)
+
+    return info, start_offset + consumed
+
+
+def prefix_sha1(path: str, offset: int) -> str:
+    """文件前 offset 字节的哈希，用来判断会话文件是否被重写过。"""
+    if offset <= 0:
+        return ""
+    h = hashlib.sha1()
+    left = offset
+    try:
+        with open(path, "rb") as f:
+            while left > 0:
+                chunk = f.read(min(1 << 16, left))
+                if not chunk:
+                    break
+                h.update(chunk)
+                left -= len(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]
+
 
 def session_key(info: dict, path: str) -> str:
     return info.get("session") or os.path.splitext(os.path.basename(path))[0]
 
 
+# ---------------------------------------------------------------------------
+# 事实校验
+# ---------------------------------------------------------------------------
+
+def _norm_match(s: str) -> str:
+    s = str(s).replace("`", "").strip().lower()
+    s = s.replace("\\", "/")
+    return re.sub(r"\s+", " ", s)
+
+
+def _source_text(info: dict) -> str:
+    parts = []
+    parts += info.get("prompts", [])
+    parts += info.get("assistant", [])
+    parts += info.get("commands", [])
+    parts += info.get("tool_results", [])
+    parts += list(info.get("files", {}).keys())
+    parts += info.get("modified", [])
+    return _norm_match("\n".join(str(p) for p in parts))
+
+
+def verify_summary(text: str, info: dict, extra_source: str = "") -> str:
+    """把摘要里反引号包裹的标识符与原文比对，未命中的标 ⚠。"""
+    source = _source_text(info)
+    if extra_source:
+        source += "\n" + _norm_match(extra_source)
+    if not source:
+        return text
+
+    out = []
+    in_identifiers = False
+    for line in text.splitlines():
+        h = line.strip()
+        if h.startswith("##"):
+            in_identifiers = h.endswith("关键标识符")
+        if in_identifiers and re.match(r"^-\s*[^：:]+[：:]", line):
+            line = _mark_unverified(line, source)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _mark_unverified(line: str, source: str) -> str:
+    def repl(m):
+        frag = m.group(1)
+        if len(frag.strip()) < 4:
+            return m.group(0)
+        needle = _norm_match(frag)
+        if len(needle) > 60:
+            needle = needle[:60]
+        if needle and needle in source:
+            return m.group(0)
+        return f"`{frag}` ⚠"
+
+    return re.sub(r"`([^`]+)`", repl, line)
+
+
+def checked_summary(cfg: "Config", text: str, info: dict,
+                    extra_source: str = "") -> str:
+    """按配置决定是否做事实校验。"""
+    return verify_summary(text, info, extra_source) if cfg.verify else text
+
+
+# ---------------------------------------------------------------------------
+# 摘要输入与模型调用
+# ---------------------------------------------------------------------------
+
+def title_of(info: dict) -> str:
+    if info.get("_first_title"):
+        return info["_first_title"]
+    if info["prompts"]:
+        return trunc(clean_prompt(info["prompts"][0]), 40) or "未命名会话"
+    return "未命名会话"
+
+
+def first_date_of(info: dict) -> str:
+    return (info.get("_first_date") or info.get("start") or "unknown").split(" ")[0]
+
+
 def project_label(info: dict, proj_dir: Optional[str], projects: Dict[str, str]) -> str:
-    """优先用会话里记录的工作目录名，其次用 Claude 项目目录名。"""
     candidates = []
     if info.get("cwd"):
         candidates.append(os.path.basename(os.path.normpath(str(info["cwd"]))))
@@ -328,40 +479,6 @@ def project_label(info: dict, proj_dir: Optional[str], projects: Dict[str, str])
         if c:
             return c
     return "未分类"
-
-
-def iter_session_files(cfg: Config) -> Iterator[Tuple[str, str, Optional[str]]]:
-    """yield (path, kind, 项目目录)。"""
-    if os.path.isdir(cfg.claude_root):
-        for proj_dir in glob.glob(os.path.join(cfg.claude_root, "*")):
-            if not os.path.isdir(proj_dir):
-                continue
-            for f in glob.glob(os.path.join(proj_dir, "*.jsonl")):
-                yield f, "claude", proj_dir
-    if os.path.isdir(cfg.codex_root):
-        for f in glob.glob(os.path.join(cfg.codex_root, "**", "*.jsonl"), recursive=True):
-            yield f, "codex", None
-
-
-def collect_files(cfg: Config) -> List[Tuple[float, str, str, Optional[str]]]:
-    files = []
-    for f, kind, proj_dir in iter_session_files(cfg):
-        try:
-            files.append((os.path.getmtime(f), f, kind, proj_dir))
-        except OSError:
-            continue
-    files.sort(key=lambda x: x[0], reverse=True)
-    return files
-
-
-# ---------------------------------------------------------------------------
-# 摘要输入与模型调用
-# ---------------------------------------------------------------------------
-
-def title_of(info: dict) -> str:
-    if info["prompts"]:
-        return trunc(clean_prompt(info["prompts"][0]), 40) or "未命名会话"
-    return "未命名会话"
 
 
 def build_transcript(info: dict, max_chars: int = 36000) -> str:
@@ -442,6 +559,65 @@ def summary_prompt(info: dict, label: str, transcript: str) -> str:
 """
 
 
+def continuation_prompt(prev_summary: str, info: dict, delta: str, date: str) -> str:
+    return f"""这是同一场 AI 编程会话此前已经生成的摘要：
+
+{prev_summary}
+
+这是这场会话之后新增的对话：
+
+{delta}
+
+请只总结新增部分带来的变化，输出 Markdown：
+## 续 · {date}
+
+### 新增了什么
+（2-4 句）
+
+### 修正了什么
+（若新增内容推翻了旧结论，写明「此前 X，现在 Y」；没有就写「无」）
+
+### 关键标识符
+- 路径：（只列新增部分实际修改、写入或报过错的，最多 6 条）
+- 命令：（最多 4 条）
+- 报错原文：（最多 2 条）
+
+### 还没完的事
+（1-3 条；没有就写「无」）
+
+要求：不要重复旧摘要里已有的内容；不要编造原文没有的事实；标识符逐字抄录。
+"""
+
+
+def merge_prompt(prev_summary: str) -> str:
+    return f"""以下是同一场 AI 编程会话的原始摘要和多次续写。请合并成一份完整摘要，
+去掉重复，保留所有关键标识符和未完成事项。若续写推翻了旧结论，以最新结论为准。
+
+只输出合并后的 Markdown 正文，保持以下结构：
+
+## 这一段在做什么
+（2-4 句）
+
+## 走过的路
+（2-5 句）
+
+## 关键标识符
+- 路径：
+- 命令：
+- 参数/flag：
+- 报错原文：
+- 版本/模型：
+- URL：
+
+## 还没完的事
+（1-3 条）
+
+以下是待合并内容：
+
+{prev_summary}
+"""
+
+
 def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 300):
     if not cfg.api_key:
         raise RuntimeError(
@@ -490,30 +666,99 @@ def summarize_one(cfg: Config, info: dict, label: str):
     return text, usage, len(transcript)
 
 
-def estimate(transcripts_chars: int) -> int:
-    """粗略估算输入 token：中文约 1 字 1 token，中英混合按 3 字符/token 估。"""
-    return transcripts_chars // 3
+def estimate(chars: int) -> int:
+    return chars // 3
 
 
 # ---------------------------------------------------------------------------
-# 输出
+# 输出：文件与块操作
 # ---------------------------------------------------------------------------
 
 def _safe_name(s: str, limit: int = 40) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", s)[:limit]
 
 
-def write_obsidian(cfg: Config, info: dict, label: str, text: str,
-                   sid: str) -> Optional[str]:
+def strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end >= 0:
+            return text[end + 5:].lstrip("\n")
+    return text
+
+
+def find_monthly_block(text: str, sid: str) -> Optional[Tuple[int, int]]:
+    """定位 `session: \\`sid\\`` 所在的块，返回 [start, end)。"""
+    marker = f"session: `{sid}`"
+    i = text.find(marker)
+    if i < 0:
+        return None
+    start = text.rfind("\n## ", 0, i)
+    start = 0 if start < 0 else start + 1
+    end = text.find("\n---", i)
+    if end < 0:
+        end = len(text)
+    else:
+        end += len("\n---")
+    return start, end
+
+
+def block_text(text: str, sid: str) -> Optional[str]:
+    span = find_monthly_block(text, sid)
+    if not span:
+        return None
+    start, end = span
+    block = text[start:end]
+    block = re.sub(r"^## .*\n+", "", block)
+    block = re.sub(r"^session: `[^`]+`\n+", "", block)
+    block = re.sub(r"\n*---\s*$", "", block)
+    return block.strip()
+
+
+def replace_block(text: str, sid: str, new_block: str) -> str:
+    span = find_monthly_block(text, sid)
+    if not span:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text + "\n" + new_block
+    start, end = span
+    return text[:start] + new_block + text[end:]
+
+
+def insert_into_block(text: str, sid: str, addition: str) -> str:
+    span = find_monthly_block(text, sid)
+    if not span:
+        return replace_block(text, sid, addition)
+    start, end = span
+    block = text[start:end]
+    body = re.sub(r"\n*---\s*$", "", block)
+    return text[:start] + body.rstrip() + "\n\n" + addition.strip() + "\n\n---" + text[end:]
+
+
+def monthly_block(month: str, info: dict, label: str, text: str, sid: str) -> str:
+    date = first_date_of(info)
+    return "\n".join([
+        f"## {date} · {label} · {info.get('turns')} 条消息",
+        "",
+        f"session: `{sid}`",
+        "",
+        text.strip(),
+        "",
+        "---",
+        "",
+    ])
+
+
+def obsidian_path(cfg: Config, info: dict, sid: str) -> Optional[str]:
     if not cfg.obsidian_dir:
         return None
-    date = (info.get("start") or "unknown").split(" ")[0]
-    sid = sid or session_key(info, "")
-    d = os.path.join(cfg.obsidian_dir, date[:7])
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"{date}_{sid[:8]}.md")
+    date = first_date_of(info)
+    return os.path.join(cfg.obsidian_dir, date[:7], f"{date}_{sid[:8]}.md")
+
+
+def obsidian_doc(info: dict, label: str, text: str, sid: str) -> str:
+    date = first_date_of(info)
     title = title_of(info).replace('"', "'")
-    md = "\n".join([
+    return "\n".join([
         "---",
         f'title: "{title}"',
         f"date: {date}",
@@ -523,31 +768,67 @@ def write_obsidian(cfg: Config, info: dict, label: str, text: str,
         f"turns: {info.get('turns')}",
         "tags: [自动摘要]",
         "---", "",
-        f"# {title}", "", text, "",
+        f"# {title}", "", text.strip(), "",
     ])
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
+
+
+def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Optional[str]:
+    path = obsidian_path(cfg, info, sid)
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(obsidian_doc(info, label, text, sid))
+
+    month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
+    if cfg.memory_dir:
+        d = os.path.join(cfg.memory_dir, "sessions")
+        os.makedirs(d, exist_ok=True)
+        mpath = os.path.join(d, f"{month}.md")
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                cur = fh.read()
+        except Exception:
+            cur = f"# {month} 会话摘要\n\n> 自动生成。原文可在本地会话记录中检索。\n"
+        cur = replace_block(cur, sid, monthly_block(month, info, label, text, sid))
+        with open(mpath, "w", encoding="utf-8") as f:
+            f.write(cur)
+        update_memory_index(cfg, month)
     return path
 
 
-def append_monthly(cfg: Config, month: str, info: dict, label: str, text: str,
-                   sid: str) -> Optional[str]:
-    if not cfg.memory_dir:
-        return None
-    d = os.path.join(cfg.memory_dir, "sessions")
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"{month}.md")
-    new_file = not os.path.exists(path)
-    date = (info.get("start") or "unknown").split(" ")[0]
-    sid = sid or session_key(info, "")
-    block = []
-    if new_file:
-        block += [f"# {month} 会话摘要", "",
-                  "> 自动生成。原文可在本地会话记录中检索。", ""]
-    block += [f"## {date} · {label} · {info.get('turns')} 条消息", "",
-              f"session: `{sid}`", "", text, "", "---", ""]
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n".join(block))
+def append_continuation(cfg: Config, info: dict, label: str, text: str,
+                        sid: str, prev_summary: str) -> Optional[str]:
+    path = obsidian_path(cfg, info, sid)
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n" + text.strip() + "\n")
+        else:
+            # 文件丢失时，用旧摘要 + 续段重建
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(obsidian_doc(info, label, prev_summary.rstrip() + "\n\n" + text, sid))
+
+    month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
+    if cfg.memory_dir:
+        d = os.path.join(cfg.memory_dir, "sessions")
+        os.makedirs(d, exist_ok=True)
+        mpath = os.path.join(d, f"{month}.md")
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                cur = fh.read()
+        except Exception:
+            cur = f"# {month} 会话摘要\n\n> 自动生成。原文可在本地会话记录中检索。\n"
+        if find_monthly_block(cur, sid):
+            cur = insert_into_block(cur, sid, text)
+        else:
+            cur = replace_block(
+                cur, sid,
+                monthly_block(month, info, label,
+                              prev_summary.rstrip() + "\n\n" + text, sid))
+        with open(mpath, "w", encoding="utf-8") as f:
+            f.write(cur)
+        update_memory_index(cfg, month)
     return path
 
 
@@ -570,46 +851,263 @@ def update_memory_index(cfg: Config, month: str) -> bool:
     return True
 
 
-def save_state(cfg: Config, state: dict) -> None:
-    path = cfg.state_file
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+def find_previous_summary(cfg: Config, key: str) -> Optional[str]:
+    """从已写入的 Obsidian 或月度文件里读回上一份摘要。"""
+    if cfg.obsidian_dir:
+        pattern = os.path.join(cfg.obsidian_dir, "*", f"*_{key[:8]}.md")
+        for p in glob.glob(pattern):
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    raw = fh.read()
+            except Exception:
+                continue
+            if f'session: "{key}"' in raw:
+                return strip_frontmatter(raw).strip()
+    if cfg.memory_dir:
+        for p in glob.glob(os.path.join(cfg.memory_dir, "sessions", "*.md")):
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    raw = fh.read()
+            except Exception:
+                continue
+            t = block_text(raw, key)
+            if t:
+                return t
+    return None
 
 
-def load_state(cfg: Config) -> dict:
+# ---------------------------------------------------------------------------
+# 索引与失败队列
+# ---------------------------------------------------------------------------
+
+def load_index(cfg: Config) -> dict:
     try:
-        with open(cfg.state_file, encoding="utf-8") as f:
-            return json.load(f)
+        with open(cfg.index_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("sessions"), dict):
+            return data
+    except Exception:
+        pass
+    return {"version": 1, "sessions": {}}
+
+
+def save_index(cfg: Config, index: dict) -> None:
+    os.makedirs(os.path.dirname(cfg.index_file) or ".", exist_ok=True)
+    tmp = cfg.index_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, cfg.index_file)
+
+
+def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
+                 source: str, mode: str) -> None:
+    index = load_index(cfg)
+    path = obsidian_path(cfg, info, sid)
+    if not path and cfg.memory_dir:
+        month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
+        path = os.path.join(cfg.memory_dir, "sessions", f"{month}.md")
+    prev = index["sessions"].get(sid) or {}
+    index["sessions"][sid] = {
+        "date": (info.get("_first_date") or info.get("start")),
+        "project": label,
+        "platform": info.get("kind"),
+        "title": title_of(info),
+        "sid": sid,
+        "file": path,
+        "source": source,
+        "mode": mode,
+        "updated": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_index(cfg, index)
+
+
+def load_failures(cfg: Config) -> dict:
+    try:
+        with open(cfg.failures_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
+def save_failures(cfg: Config, failures: dict) -> None:
+    os.makedirs(os.path.dirname(cfg.failures_file) or ".", exist_ok=True)
+    tmp = cfg.failures_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(failures, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, cfg.failures_file)
+
+
+def record_failure(cfg: Config, key: str, path: str, error: str,
+                   kind: str = "claude") -> None:
+    failures = load_failures(cfg)
+    ent = failures.get(key) or {"attempts": 0}
+    ent.update({
+        "path": path,
+        "kind": kind,
+        "error": str(error)[:500],
+        "attempts": int(ent.get("attempts", 0)) + 1,
+        "last": datetime.now().isoformat(timespec="seconds"),
+    })
+    failures[key] = ent
+    save_failures(cfg, failures)
+
+
+def clear_failure(cfg: Config, key: str) -> None:
+    failures = load_failures(cfg)
+    if key in failures:
+        del failures[key]
+        save_failures(cfg, failures)
+
+
 # ---------------------------------------------------------------------------
-# 规划
+# 状态
 # ---------------------------------------------------------------------------
 
-def plan_nightly(cfg: Config, state: dict) -> List[Tuple[dict, str, str, str, str]]:
-    """返回 [(info, label, kind, path, key)]，按修改时间倒序，最多 max_sessions 条。"""
+def load_state(cfg: Config) -> dict:
+    try:
+        with open(cfg.state_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(cfg: Config, state: dict) -> None:
+    os.makedirs(os.path.dirname(cfg.state_file) or ".", exist_ok=True)
+    tmp = cfg.state_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, cfg.state_file)
+
+
+# ---------------------------------------------------------------------------
+# 扫描与规划
+# ---------------------------------------------------------------------------
+
+def iter_session_files(cfg: Config) -> Iterator[Tuple[str, str, Optional[str]]]:
+    if os.path.isdir(cfg.claude_root):
+        for proj_dir in glob.glob(os.path.join(cfg.claude_root, "*")):
+            if not os.path.isdir(proj_dir):
+                continue
+            for f in glob.glob(os.path.join(proj_dir, "*.jsonl")):
+                yield f, "claude", proj_dir
+    if os.path.isdir(cfg.codex_root):
+        for f in glob.glob(os.path.join(cfg.codex_root, "**", "*.jsonl"), recursive=True):
+            yield f, "codex", None
+
+
+def collect_files(cfg: Config) -> List[Tuple[float, str, str, Optional[str]]]:
+    files = []
+    for f, kind, proj_dir in iter_session_files(cfg):
+        try:
+            files.append((os.path.getmtime(f), f, kind, proj_dir))
+        except OSError:
+            continue
+    files.sort(key=lambda x: x[0], reverse=True)
+    return files
+
+
+def _migrate_entry(cfg: Config, state: dict, key: str, path: str) -> None:
+    """v0.1 状态没有 offset：补签，不重跑。"""
+    size = os.path.getsize(path)
+    state[key]["offset"] = size
+    state[key]["prefix_sha1"] = prefix_sha1(path, size)
+    state[key].setdefault("sections", 0)
+
+
+def plan_nightly(cfg: Config, state: dict) -> Tuple[List[Task], List[str]]:
     now = time.time()
-    todo = []
-    for mt, f, kind, proj_dir in collect_files(cfg):
+    tasks: List[Task] = []
+    notes: List[str] = []
+
+    for mt, path, kind, proj_dir in collect_files(cfg):
         if now - mt < cfg.min_age_hours * 3600:
             continue
-        info = parse_session(f, kind)
-        if not info["turns"] and not info["prompts"]:
+        key = os.path.splitext(os.path.basename(path))[0]
+        entry = None if cfg.force else state.get(key)
+
+        # 先用文件名猜 key，解析后再用真实 session id 修正
+        if entry is None:
+            info = parse_session(path, kind)
+            if not info["turns"] and not info["prompts"]:
+                continue
+            key = session_key(info, path)
+            entry = None if cfg.force else state.get(key)
+            if entry is None:
+                if info["turns"] < cfg.min_turns:
+                    continue
+                size = os.path.getsize(path)
+                tasks.append(Task(
+                    info=info, label=project_label(info, proj_dir, cfg.projects),
+                    kind=kind, path=path, key=key, mode="full",
+                    start_offset=0, new_offset=size))
+                if len(tasks) >= cfg.max_sessions:
+                    break
+                continue
+
+        # 旧条目迁移
+        if "offset" not in entry:
+            _migrate_entry(cfg, state, key, path)
+            notes.append(f"迁移旧状态：{key[:8]}（不重跑）")
             continue
-        key = session_key(info, f)
-        if key in state and not cfg.force:
+
+        offset = int(entry["offset"])
+        size = os.path.getsize(path)
+
+        # 先校验前缀：文件被重写（哪怕大小相同）都要整场重跑
+        if size < offset or prefix_sha1(path, offset) != entry.get("prefix_sha1"):
+            info = parse_session(path, kind)
+            tasks.append(Task(
+                info=info, label=project_label(info, proj_dir, cfg.projects),
+                kind=kind, path=path, key=key, mode="full",
+                start_offset=0, new_offset=size))
+            notes.append(f"文件被重写，整场重跑：{key[:8]}")
+            if len(tasks) >= cfg.max_sessions:
+                break
             continue
-        if info["turns"] < cfg.min_turns:
+
+        if size == offset:
+            if int(entry.get("sections", 0)) >= cfg.merge_after:
+                info = parse_session(path, kind)
+                prev = find_previous_summary(cfg, key)
+                if prev:
+                    tasks.append(Task(
+                        info=info, label=project_label(info, proj_dir, cfg.projects),
+                        kind=kind, path=path, key=key, mode="merge",
+                        start_offset=offset, new_offset=offset,
+                        prev_summary=prev, sections=int(entry.get("sections", 0))))
             continue
-        todo.append((info, project_label(info, proj_dir, cfg.projects), kind, f, key))
-        if len(todo) >= cfg.max_sessions:
+
+        delta, new_offset = parse_incremental(path, kind, offset)
+        delta_chars = len(build_transcript(delta))
+        if delta["turns"] < cfg.min_delta_turns and delta_chars < cfg.min_delta_chars:
+            continue
+        prev = find_previous_summary(cfg, key)
+        if not prev:
+            info = parse_session(path, kind)
+            tasks.append(Task(
+                info=info, label=project_label(info, proj_dir, cfg.projects),
+                kind=kind, path=path, key=key, mode="full",
+                start_offset=0, new_offset=size))
+            notes.append(f"找不到旧摘要，整场重跑：{key[:8]}")
+            if len(tasks) >= cfg.max_sessions:
+                break
+            continue
+
+        info = delta
+        info["session"] = info.get("session") or key
+        tasks.append(Task(
+            info=info, label=project_label(info, proj_dir, cfg.projects),
+            kind=kind, path=path, key=key, mode="incremental",
+            start_offset=offset, new_offset=new_offset, prev_summary=prev,
+            sections=int(entry.get("sections", 0))))
+        if len(tasks) >= cfg.max_sessions:
             break
-    return todo
+
+    if tasks:
+        tasks.sort(key=lambda t: t.info.get("start") or "", reverse=True)
+    return tasks, notes
 
 
 def plan_preview(cfg: Config, n: int) -> List[Tuple[dict, str, str, str, str]]:
@@ -625,13 +1123,90 @@ def plan_preview(cfg: Config, n: int) -> List[Tuple[dict, str, str, str, str]]:
     return out
 
 
-def print_plan(todo, cfg: Config) -> int:
-    chars = 0
-    for info, _label, _kind, path, _key in todo:
-        chars += len(build_transcript(info))
-    print(f"计划处理 {len(todo)} 场会话，预计输入约 {estimate(chars):,} tokens"
+def print_plan(tasks, notes: Optional[List[str]] = None) -> None:
+    chars = sum(len(build_transcript(t.info)) for t in tasks)
+    print(f"计划处理 {len(tasks)} 项，预计输入约 {estimate(chars):,} tokens"
           f"（输出另计，按你所用模型的价格收费）")
-    return chars
+    for t in tasks:
+        mode = {"full": "全量", "incremental": "续写", "merge": "合并"}[t.mode]
+        print(f"  [{mode}] [{t.label}] {t.info.get('start')} · "
+              f"{t.info.get('turns')} 条消息 · {os.path.basename(t.path)}")
+    for n in notes or []:
+        print(f"  · {n}")
+
+
+# ---------------------------------------------------------------------------
+# 执行
+# ---------------------------------------------------------------------------
+
+def _today(info: dict) -> str:
+    return (info.get("end") or info.get("start") or datetime.now().strftime("%Y-%m-%d %H:%M"))[:16]
+
+
+def execute_task(cfg: Config, task: Task, state: dict) -> bool:
+    sid = task.key
+    prev_entry = state.get(sid) or {}
+    info = dict(task.info)
+    info["_first_date"] = prev_entry.get("first_date") or info.get("start")
+    info["_first_title"] = prev_entry.get("first_title") or title_of(info)
+
+    try:
+        if task.mode == "full":
+            text, usage, nchars = summarize_one(cfg, info, task.label)
+            text = checked_summary(cfg, text, info)
+            write_full(cfg, info, task.label, text, sid)
+            sections = 0
+            print(f"  全量 {nchars} 字符 -> in={usage.get('input_tokens')} "
+                  f"out={usage.get('output_tokens')}")
+
+        elif task.mode == "incremental":
+            delta = build_transcript(info)
+            prompt = continuation_prompt(task.prev_summary or "", info, delta,
+                                         _today(info))
+            text, usage = call_llm(cfg, prompt)
+            text = checked_summary(cfg, text, info, task.prev_summary or "")
+            append_continuation(cfg, info, task.label, text, sid,
+                                task.prev_summary or "")
+            sections = task.sections + 1
+            print(f"  续写 {len(delta)} 字符 -> in={usage.get('input_tokens')} "
+                  f"out={usage.get('output_tokens')}（第 {sections} 段）")
+
+        else:  # merge
+            text, usage = call_llm(cfg, merge_prompt(task.prev_summary or ""))
+            text = checked_summary(cfg, text, info)
+            write_full(cfg, info, task.label, text, sid)
+            sections = 0
+            print(f"  合并 -> in={usage.get('input_tokens')} "
+                  f"out={usage.get('output_tokens')}")
+
+        if task.mode in ("full", "merge"):
+            new_offset = os.path.getsize(task.path)
+        else:
+            new_offset = task.new_offset
+
+        state[sid] = {
+            "offset": new_offset,
+            "prefix_sha1": prefix_sha1(task.path, new_offset),
+            "sections": sections,
+            "date": info.get("_first_date"),
+            "first_date": info.get("_first_date"),
+            "first_title": info.get("_first_title"),
+            "source": task.path,
+            "tokens": usage,
+            "done_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        save_state(cfg, state)
+        update_index(cfg, info, task.label, text, sid, task.path, task.mode)
+        clear_failure(cfg, sid)
+        return True
+
+    except Exception as e:
+        print("  失败:", e, file=sys.stderr)
+        if cfg.verbose:
+            import traceback
+            traceback.print_exc()
+        record_failure(cfg, sid, task.path, e, task.kind)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +1218,9 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
     if not todo:
         print("没有找到可处理的会话。")
         return 0
-    print_plan(todo, cfg)
+    chars = sum(len(build_transcript(i)) for i, *_ in todo)
+    print(f"计划处理 {len(todo)} 场会话，预计输入约 {estimate(chars):,} tokens"
+          f"（输出另计，按你所用模型的价格收费）")
     if dry:
         for info, label, _kind, path, _key in todo:
             print(f"  [{label}] {info.get('start')} · {info.get('turns')} 条消息 · {path}")
@@ -660,6 +1237,7 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
                 import traceback
                 traceback.print_exc()
             continue
+        text = checked_summary(cfg, text, info)
         date = (info.get("start") or "unknown").split(" ")[0]
         title = title_of(info).replace('"', "'")
         out = os.path.join(cfg.out_dir, f"{date}_{key[:8]}.md")
@@ -683,53 +1261,117 @@ def cmd_nightly(cfg: Config, dry: bool) -> int:
         return 2
 
     state = load_state(cfg)
-    todo = plan_nightly(cfg, state)
-    if not todo:
+    failures = load_failures(cfg)
+    retry = [k for k, v in failures.items() if int(v.get("attempts", 0)) < 3]
+
+    tasks, notes = plan_nightly(cfg, state)
+
+    if retry:
+        print(f"失败队列中有 {len(retry)} 项待重试")
+        planned = {t.key for t in tasks}
+        for key in retry:
+            if key in planned:
+                continue
+            f = failures[key]
+            p = f.get("path")
+            if not p or not os.path.exists(p):
+                continue
+            kind = f.get("kind") or "claude"
+            info = parse_session(p, kind)
+            if info["turns"] or info["prompts"]:
+                tasks.insert(0, Task(info=info, label=project_label(info, None, cfg.projects),
+                                     kind=kind, path=p, key=key, mode="full",
+                                     new_offset=os.path.getsize(p)))
+
+    if not tasks:
         print("没有需要提炼的新会话。")
+        for n in notes:
+            print(f"  · {n}")
         return 0
-    print_plan(todo, cfg)
+
+    print_plan(tasks, notes)
     if dry:
-        for info, label, _kind, path, key in todo:
-            print(f"  [{label}] {info.get('start')} · {info.get('turns')} 条消息 · "
-                  f"{os.path.basename(path)}")
         return 0
 
     done = 0
-    for i, (info, label, kind, path, key) in enumerate(todo, 1):
-        print(f"[{i}/{len(todo)}] {label} | {info.get('start')} | {info.get('turns')} 条消息")
-        try:
-            text, usage, nchars = summarize_one(cfg, info, label)
-        except Exception as e:
-            print("  失败:", e, file=sys.stderr)
-            if cfg.verbose:
-                import traceback
-                traceback.print_exc()
+    for i, task in enumerate(tasks, 1):
+        print(f"[{i}/{len(tasks)}] {task.label} | {task.info.get('start')} | "
+              f"{task.info.get('turns')} 条消息")
+        if execute_task(cfg, task, state):
+            done += 1
+
+    print(f"完成 {done} 项")
+    return 0 if done == len(tasks) else 1
+
+
+def cmd_retry_failed(cfg: Config, dry: bool) -> int:
+    failures = load_failures(cfg)
+    if not failures:
+        print("失败队列为空。")
+        return 0
+    print(f"失败队列：{len(failures)} 项")
+    if dry:
+        for key, v in failures.items():
+            print(f"  {key[:8]} · 尝试 {v.get('attempts', 0)} 次 · {v.get('error', '')[:80]}")
+        return 0
+
+    state = load_state(cfg)
+    done = 0
+    for key, v in list(failures.items()):
+        path = v.get("path")
+        if not path or not os.path.exists(path):
+            print(f"  跳过 {key[:8]}：源文件不存在")
             continue
+        kind = v.get("kind") or "claude"
+        info = parse_session(path, kind)
+        if not info["turns"] and not info["prompts"]:
+            continue
+        task = Task(info=info, label=project_label(info, None, cfg.projects),
+                    kind=kind, path=path, key=key, mode="full",
+                    new_offset=os.path.getsize(path))
+        print(f"[{key[:8]}] {task.label} | {info.get('start')}")
+        if execute_task(cfg, task, state):
+            done += 1
+    print(f"完成 {done} 项")
+    return 0 if done == len(failures) else 1
 
-        month = (info.get("start") or "")[:7] or datetime.now().strftime("%Y-%m")
-        append_monthly(cfg, month, info, label, text, key)
-        write_obsidian(cfg, info, label, text, key)
-        update_memory_index(cfg, month)
 
-        state[key] = {
-            "date": info.get("start"),
-            "source": path,
-            "tokens": usage,
-            "done_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        save_state(cfg, state)
-        done += 1
-        print(f"  {nchars} 字符 -> in={usage.get('input_tokens')} "
-              f"out={usage.get('output_tokens')}")
+def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
+    index = load_index(cfg)
+    items = list(index["sessions"].values())
+    if project:
+        items = [v for v in items if project.lower() in str(v.get("project", "")).lower()]
+    items.sort(key=lambda v: v.get("date") or "", reverse=True)
+    items = items[:n]
+    if not items:
+        print("索引里没有匹配的会话。先跑 --nightly 或 --export。", file=sys.stderr)
+        return 1
 
-    print(f"完成 {done} 场")
+    for v in items:
+        path = v.get("file")
+        text = ""
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    raw = fh.read()
+                monthly_root = os.path.normpath(
+                    os.path.join(cfg.memory_dir, "sessions")) if cfg.memory_dir else ""
+                is_monthly = monthly_root and os.path.normpath(path).startswith(monthly_root)
+                text = block_text(raw, v.get("sid", "")) if is_monthly \
+                    else strip_frontmatter(raw)
+            except Exception:
+                text = ""
+        print(f"\n## {v.get('date', '')[:10]} · {v.get('project', '')} · {v.get('title', '')}")
+        print()
+        print(text.strip() or "（摘要文件缺失）")
+        print("\n---")
     return 0
 
 
 def cmd_export(cfg: Config) -> int:
-    """全量导出，不调模型。生成按项目分组的 Markdown 和 README 索引。"""
     idx = {"claude": OrderedDict(), "codex": OrderedDict()}
     total = 0
+    index = load_index(cfg)
 
     for mt, f, kind, proj_dir in collect_files(cfg):
         info = parse_session(f, kind)
@@ -743,8 +1385,13 @@ def cmd_export(cfg: Config) -> int:
         else:
             out = os.path.join(cfg.out_dir, "Codex", fname)
         write_plain_session(out, info, label)
-        idx[kind].setdefault(label, []).append((fname, info))
+        idx[kind].setdefault(label, []).append((fname, info, out))
         total += 1
+        index["sessions"][sid] = {
+            "date": info.get("start"), "project": label, "platform": kind,
+            "title": title_of(info), "sid": sid, "file": out, "source": f,
+            "mode": "export", "updated": datetime.now().isoformat(timespec="seconds"),
+        }
 
     lines = ["---", "title: 会话记忆库", "tags: [index]", "---", "",
              "# 会话记忆库", "",
@@ -756,7 +1403,7 @@ def cmd_export(cfg: Config) -> int:
         lines.append(f"## {name}")
         for label, items in groups.items():
             lines.append(f"### {label}")
-            for fname, info in items:
+            for fname, info, _out in items:
                 d = (info.get("start") or "")[:10]
                 lines.append(f"- [[{os.path.splitext(fname)[0]}]] — {d} · {title_of(info)}")
             lines.append("")
@@ -764,6 +1411,7 @@ def cmd_export(cfg: Config) -> int:
     os.makedirs(cfg.out_dir, exist_ok=True)
     with open(os.path.join(cfg.out_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    save_index(cfg, index)
     print(f"导出完成：{total} 场会话 -> {cfg.out_dir}")
     return 0
 
@@ -771,7 +1419,7 @@ def cmd_export(cfg: Config) -> int:
 def write_plain_session(path: str, info: dict, label: str) -> None:
     title = title_of(info)
     md = ["---",
-          f'title: "{title}"',
+          f'title: "{title.replace(chr(34), chr(39))}"',
           f'date: {(info.get("start") or "").split(" ")[0] or "未知"}',
           f"project: {label}",
           f"platform: {info['kind']}",
@@ -814,13 +1462,17 @@ def build_config(args) -> Config:
     base_url, api_key, model = resolve_llm(args)
     state_file = args.state_file or os.path.expanduser(
         "~/.claude-session-digest/state.json")
+    state_file = _expand(state_file) or state_file
+    sdir = os.path.dirname(state_file) or "."
     return Config(
         claude_root=_expand(args.claude_root) or os.path.expanduser("~/.claude/projects"),
         codex_root=_expand(args.codex_root) or os.path.expanduser("~/.codex/sessions"),
         out_dir=_expand(args.out) or "digest-output",
         obsidian_dir=_expand(args.obsidian_dir),
         memory_dir=_expand(args.memory_dir),
-        state_file=_expand(state_file),
+        state_file=state_file,
+        index_file=_expand(args.index_file) or os.path.join(sdir, "index.json"),
+        failures_file=_expand(args.failures_file) or os.path.join(sdir, "failures.json"),
         projects=load_projects(args.projects_file),
         base_url=base_url,
         api_key=api_key,
@@ -828,7 +1480,11 @@ def build_config(args) -> Config:
         min_turns=args.min_turns,
         min_age_hours=args.min_age_hours,
         max_sessions=args.max_sessions,
+        merge_after=args.merge_after,
+        min_delta_turns=args.min_delta_turns,
+        min_delta_chars=args.min_delta_chars,
         force=args.force,
+        verify=not args.no_verify,
         verbose=args.verbose,
     )
 
@@ -846,29 +1502,29 @@ def main(argv=None) -> int:
         epilog="示例：\n"
                "  python session_digest.py --export\n"
                "  python session_digest.py --llm 3 --dry-run\n"
-               "  python session_digest.py --nightly --obsidian-dir ~/vault/摘要\n")
+               "  python session_digest.py --nightly --obsidian-dir ~/vault/摘要\n"
+               "  python session_digest.py --context 5 --project shop\n")
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--export", action="store_true",
-                      help="全量导出，不调用模型")
-    mode.add_argument("--llm", type=int, metavar="N",
-                      help="预览：对最近 N 场会话生成摘要")
-    mode.add_argument("--nightly", action="store_true",
-                      help="正式：增量提炼新会话")
+    mode.add_argument("--export", action="store_true", help="全量导出，不调用模型")
+    mode.add_argument("--llm", type=int, metavar="N", help="预览：对最近 N 场会话生成摘要")
+    mode.add_argument("--nightly", action="store_true", help="增量提炼新会话")
+    mode.add_argument("--context", type=int, metavar="N", help="输出最近 N 份摘要的拼接文本")
+    mode.add_argument("--retry-failed", action="store_true", help="只重试失败队列")
 
+    ap.add_argument("--project", default=None, help="--context 时按项目名过滤")
     ap.add_argument("--claude-root", default=None,
                     help="Claude Code 会话目录（默认 ~/.claude/projects）")
     ap.add_argument("--codex-root", default=None,
                     help="Codex 会话目录（默认 ~/.codex/sessions）")
-    ap.add_argument("--out", default=None,
-                    help="导出 / 预览输出目录（默认 digest-output）")
-    ap.add_argument("--obsidian-dir", default=None,
-                    help="Obsidian 摘要目录；给了才会写")
-    ap.add_argument("--memory-dir", default=None,
-                    help="memory 目录；给了才会写 MEMORY.md 索引")
+    ap.add_argument("--out", default=None, help="导出 / 预览输出目录（默认 digest-output）")
+    ap.add_argument("--obsidian-dir", default=None, help="Obsidian 摘要目录；给了才会写")
+    ap.add_argument("--memory-dir", default=None, help="memory 目录；给了才会写索引")
     ap.add_argument("--state-file", default=None,
-                    help="去重状态文件（默认 ~/.claude-session-digest/state.json）")
+                    help="去重与偏移状态（默认 ~/.claude-session-digest/state.json）")
+    ap.add_argument("--index-file", default=None, help="索引 JSON（默认与 state 同目录）")
+    ap.add_argument("--failures-file", default=None, help="失败队列 JSON（默认与 state 同目录）")
     ap.add_argument("--projects-file", default=None,
                     help="项目名映射 JSON，如 {\"my-repo\": \"我的项目\"}")
 
@@ -877,18 +1533,26 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default=None, help="模型名（默认 claude-sonnet-5-5）")
 
     ap.add_argument("--min-turns", type=int, default=8,
-                    help="少于 N 条消息的会话跳过（默认 8）")
+                    help="新会话少于 N 条消息时跳过（默认 8）")
     ap.add_argument("--min-age-hours", type=int, default=6,
                     help="结束不足 N 小时的会话跳过（默认 6）")
     ap.add_argument("--max-sessions", type=int, default=20,
-                    help="单次最多处理 N 场（默认 20）")
-    ap.add_argument("--force", action="store_true", help="忽略去重状态，重跑")
+                    help="单次最多处理 N 项（默认 20）")
+    ap.add_argument("--merge-after", type=int, default=3,
+                    help="续写达到 N 段后合并整理（默认 3）")
+    ap.add_argument("--min-delta-turns", type=int, default=4,
+                    help="新增少于 N 条消息且字数不足时跳过（默认 4）")
+    ap.add_argument("--min-delta-chars", type=int, default=500,
+                    help="新增少于 N 字符且消息不足时跳过（默认 500）")
+    ap.add_argument("--force", action="store_true", help="忽略状态，全部重跑")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="不做事实校验（不把标识符与原文比对、不加 ⚠ 标记）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只列出计划和 token 估算，不调用模型、不写文件")
     ap.add_argument("--verbose", action="store_true", help="失败时打印完整堆栈")
 
     args = ap.parse_args(argv)
-    if not (args.export or args.llm or args.nightly):
+    if not (args.export or args.llm or args.nightly or args.context or args.retry_failed):
         ap.print_help()
         return 0
 
@@ -897,6 +1561,10 @@ def main(argv=None) -> int:
         return cmd_export(cfg)
     if args.llm:
         return cmd_preview(cfg, args.llm, args.dry_run)
+    if args.context:
+        return cmd_context(cfg, args.context, args.project)
+    if args.retry_failed:
+        return cmd_retry_failed(cfg, args.dry_run)
     return cmd_nightly(cfg, args.dry_run)
 
 
