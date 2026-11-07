@@ -375,7 +375,10 @@ def resolve_path_ref(cfg: Config, ref) -> Optional[str]:
     """把 {root, rel} 还原成绝对路径；越界或结构不对返回 None。"""
     if not isinstance(ref, dict):
         return None
-    root = _root_dir(cfg, ref.get("root"))
+    root_name = ref.get("root")
+    if not isinstance(root_name, str):
+        return None
+    root = _root_dir(cfg, root_name)
     rel = ref.get("rel")
     if not root or not isinstance(rel, str) or not rel:
         return None
@@ -1314,7 +1317,7 @@ def scrub_state(cfg: Config, state: dict) -> bool:
         if not isinstance(entry, dict):
             continue
         raw_source = entry.get("source")
-        if raw_source and "source_ref" not in entry:
+        if isinstance(raw_source, str) and raw_source and "source_ref" not in entry:
             ref = make_path_ref(cfg, raw_source)
             if ref:
                 entry["source_ref"] = ref
@@ -1341,7 +1344,7 @@ def migrate_index(cfg: Config, index: dict) -> bool:
             continue
         for key in ("file", "source"):
             raw = rec.get(key)
-            if raw and key + "_ref" not in rec:
+            if isinstance(raw, str) and raw and key + "_ref" not in rec:
                 ref = make_path_ref(cfg, raw)
                 if ref:
                     rec[key + "_ref"] = ref
@@ -1368,7 +1371,7 @@ def migrate_failures(cfg: Config, failures: dict) -> bool:
         if not isinstance(entry, dict):
             continue
         raw = entry.get("path")
-        if raw and "path_ref" not in entry:
+        if isinstance(raw, str) and raw and "path_ref" not in entry:
             ref = make_path_ref(cfg, raw)
             if ref:
                 entry["path_ref"] = ref
