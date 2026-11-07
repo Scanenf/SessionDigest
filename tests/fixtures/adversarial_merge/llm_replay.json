@@ -1,0 +1,21 @@
+{
+  "replay_version": 1,
+  "kind": "handcrafted",
+  "model": "handcrafted",
+  "api_format": "anthropic",
+  "prompt_version": 2,
+  "max_tokens": 8000,
+  "recorded_at": "2026-11-08",
+  "entries": [
+    {
+      "mode": "full",
+      "response": "## 这一段在做什么\n你在 shop 项目里明确暂时继续用本地文件缓存，不换成 Redis；同时给登录状态加了 30 分钟过期时间。\n\n## 走过的路\n缓存层不换 Redis，因为部署环境没有 Redis，暂时继续用本地文件缓存。助手查看了 `C:/work/shop/src/cache.py`，并按 30 分钟过期修改了 `C:/work/shop/src/auth.py`。\n\n## 关键标识符\n- 路径：`C:/work/shop/src/cache.py`、`C:/work/shop/src/auth.py`\n- 命令：无\n- 参数/flag：30 分钟\n- 报错原文：无\n- 版本/模型：无\n- URL：无\n\n## 还没完的事\n- API 超时重试还没处理。",
+      "usage": {"input_tokens": 0, "output_tokens": 0}
+    },
+    {
+      "mode": "merge",
+      "response": "## 这一段在做什么\n你在 shop 项目里暂不换用 Redis；登录状态增加了 30 分钟过期时间。\n\n## 走过的路\n缓存层暂不换用 Redis。助手查看了 `C:/work/shop/src/cache.py`，并按 30 分钟过期修改了 `C:/work/shop/src/auth.py`。\n\n## 关键标识符\n- 路径：`C:/work/shop/src/cache.py`、`C:/work/shop/src/auth.py`\n- 命令：无\n- 参数/flag：30 分钟\n- 报错原文：无\n- 版本/模型：无\n- URL：无\n\n## 还没完的事\n- API 超时重试还没处理。",
+      "usage": {"input_tokens": 0, "output_tokens": 0}
+    }
+  ]
+}

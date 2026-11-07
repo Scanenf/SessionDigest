@@ -1,0 +1,24 @@
+{
+  "project": "shop",
+  "expected_facts": {
+    "paths": ["src/export.py", "tests/test_export.py"],
+    "commands": ["python -m pytest tests/test_export.py -q"],
+    "decisions": ["RFC 5987", "filename*"],
+    "open_items": ["大文件内存占用"]
+  },
+  "key_conclusions": [
+    {
+      "id": "filename-encoding",
+      "statement": "使用 RFC 5987 filename* 编码",
+      "reason": "中文文件名在下载时会乱码",
+      "status": "active",
+      "source": "prompt#2",
+      "require": ["RFC 5987", "filename*"],
+      "require_reason": ["中文文件名", "乱码"],
+      "forbid": ["使用 latin-1 编码", "不处理编码"]
+    }
+  ],
+  "forbidden_facts": ["/missing/fabricated.py", "src/legacy.py"],
+  "foreign_facts": ["other-project/api.py"],
+  "forbidden_strings": ["sk-ant-", "C:/Users/alice", "alice"]
+}

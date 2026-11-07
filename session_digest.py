@@ -38,6 +38,8 @@ from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
 VERSION = "0.4.0"
+# 提示词版本：摘要结构或约束变化时递增；Golden 回放文件按它校验。
+PROMPT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -1588,7 +1590,8 @@ def summary_prompt(info: dict, label: str, transcript: str) -> str:
 2. 「关键标识符」必须逐字抄录，不得改写、概括或翻译；不要加省略号，不要补全参数。但只收关键项，宁可少列，不要罗列。每一项没有就写「无」。
 3. 只写会话记录里明确出现的事实。助手自己的推测、承诺、计划或「应该没问题」不算事实，不能当成已发生的结果。
 4. 命令只有记录里确实调用执行过才能写进「命令」；只在讨论里提到的，要写「提到」而不是「执行」。没有明确成功输出（如 exit code 0、Process exited with code 0、All tests passed）时，不得写「通过」「成功」「修复完成」。
-5. 不要自己添加 ⚠、⚠≠、⚠? 等标记，程序会统一校验和标注。
+5. 「还没完的事」只能来自用户明确说的未完成事项，或记录里明确的报错/未完成事实；助手自己承诺、计划、提议要做的事不算未完成事项。
+6. 不要自己添加 ⚠、⚠≠、⚠? 等标记，程序会统一校验和标注。
 
 严格按以下结构输出：
 
@@ -1641,8 +1644,9 @@ def continuation_prompt(prev_summary: str, info: dict, delta: str, date: str) ->
 ### 还没完的事
 （1-3 条；没有就写「无」）
 
-要求：不要重复旧摘要里已有的内容；只写新增记录里明确出现的事实，助手的推测不算事实；
+要求：不要重复旧摘要里已有的内容；只写新增记录里明确出现的事实，助手的推测、承诺和计划不算事实；
 标识符逐字抄录，不要加省略号；命令只有确实执行过才能写成「执行」，没有明确成功输出不得写「通过」「成功」；
+「还没完的事」只能来自用户明确说的未完成事项或记录里明确的未完成事实，助手承诺要做的事不算；
 不要自己添加 ⚠、⚠≠、⚠? 标记。
 """
 
@@ -1671,6 +1675,7 @@ def merge_prompt(prev_summary: str) -> str:
 （1-3 条）
 
 要求：标识符逐字保留，不要加省略号或补全参数；不要编造待合并内容里没有的事实；
+「还没完的事」只保留待合并内容里已有的用户未完成事项，助手承诺或计划要做的事不算；
 不要自己添加 ⚠、⚠≠、⚠? 标记，已有的标记保持原样。
 
 以下是待合并内容：
@@ -2223,6 +2228,7 @@ def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
             cfg, source, "claude" if info.get("kind") == "claude" else "codex",
             sid=sid),
         "mode": mode,
+        "prompt_version": PROMPT_VERSION,
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     save_index(cfg, index)

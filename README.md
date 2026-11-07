@@ -153,6 +153,34 @@ flag 顺序无关但重复计数，位置参数顺序和值必须一致。`pytes
 `⚠≠` 的 basename/subcommand 启发式和 `⚠?` 的结果词检测都会误报，
 用 `--no-verify` 可整体关闭校验。
 
+## Golden Dataset（质量快照）
+
+`tests/fixtures/` 下有三组固定样本：`basic_claude`、`incremental_codex`、
+`adversarial_merge`。每组包含会话原文、人工写下的期望事实与关键结论，
+以及 `llm_replay.json`。测试用回放响应跑完整管线，不访问网络。
+
+`TestGoldenPipeline` 断言结构、脱敏、事实标记、偏移、索引、幂等和合并防丢，
+说明的是**管线契约正确，不证明模型质量**。
+
+`TestGoldenQualitySnapshot` 只使用 `basic_claude` 里录制的一次真实响应
+（`kind: recorded`，记录模型名、接口格式、`prompt_version` 和日期），
+断言这次响应通过同一组检测器。它说明的是**某个模型 + 某个 prompt 版本的
+一次快照，不是普遍质量结论**，不能外推到其他会话、其他模型或真实幻觉率。
+
+关键结论检查包括陈述、原因、状态和跨项目事实：保留“不迁移数据库”但丢掉
+“数据结构尚未稳定”会单独报 `missing_reason`；已推翻的旧决定写成“目前仍…”
+会报 `stale_decision`。这些检测器是关键词覆盖，只能发现明显丢失，
+不能证明语义完全保留。
+
+`llm_replay.json` 的 `prompt_version` 与代码里的 `PROMPT_VERSION` 不一致时
+测试直接失败，强制重新录制。重新录制用：
+
+```bash
+python tests/record_golden.py tests/fixtures/basic_claude --mode full
+```
+
+脚本会先脱敏再写盘，但提交前仍须人工审阅响应。
+
 ## 脱敏
 
 默认开启 `--redact strict`。处理覆盖四处：
@@ -474,12 +502,14 @@ v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏�
 python -m unittest discover -s tests -v
 ```
 
-115 个用例，覆盖两个解析器、命令事件关联、严格 argv 比对与证据等级、
+132 个用例，覆盖两个解析器、命令事件关联、严格 argv 比对与证据等级、
 增量读取、前缀哈希、事实校验（含 `--no-verify`）、脱敏（密钥/邮箱/内网 IP/
 主目录路径、发送前与落盘前各一道）、v2 路径引用与旧数据迁移、读取与异常输出的
 二次脱敏、月度块替换、规划判定、索引、失败队列、`--context`/`--find` 过滤，
 以及增量可靠性（截断不推进偏移、写入后崩溃不重复、三轮续写后合并、调用期间
 追加、偏移落半行、合并丢失结论被拒、正文 `---`/`##` 不截断月度块）、
+Golden Dataset（管线契约、录制快照、事实遗漏/编造/待办误标完成/推测当事实/
+旧决定未更新/跨项目事实/原因丢失/合并丢原因）、
 进程锁（含跨进程争抢）、原子写入中断、HTTP 错误、超时、非 JSON 响应、
 模型返回被截断等异常恢复场景。
 另有一组哨兵扫描测试，把 state/index/failures/摘要/导出/终端/异常栈/临时文件/

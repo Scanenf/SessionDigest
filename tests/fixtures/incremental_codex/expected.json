@@ -1,0 +1,25 @@
+{
+  "project": "pet",
+  "split_after": 7,
+  "expected_full_facts": {
+    "paths": [],
+    "commands": ["npm run build"],
+    "decisions": ["状态事件"],
+    "open_items": ["失败状态"]
+  },
+  "expected_delta_facts": {
+    "paths": [],
+    "commands": ["npm run build:prod"],
+    "decisions": ["devicePixelRatio"],
+    "open_items": ["4K 屏"]
+  },
+  "expected_merged_facts": {
+    "paths": [],
+    "commands": ["npm run build", "npm run build:prod"],
+    "decisions": ["devicePixelRatio"],
+    "open_items": ["4K 屏"]
+  },
+  "forbidden_facts": ["/missing/fabricated.py"],
+  "foreign_facts": ["other-project/api.py"],
+  "forbidden_strings": ["sk-ant-", "C:/Users/alice", "alice"]
+}

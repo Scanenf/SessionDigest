@@ -14,7 +14,9 @@ from io import StringIO
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session_digest as sd  # noqa: E402
+import replay  # noqa: E402
 
 
 def make_cfg(tmp):
@@ -2078,6 +2080,344 @@ class TestLLMTruncation(unittest.TestCase):
                 sd.call_llm(cfg, "写摘要", max_tokens=32000)
             self.assertIn("截断", str(cm.exception))
             self.assertEqual(len(srv.requests), 1)
+
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def fixture_file(name, filename):
+    return os.path.join(FIXTURES, name, filename)
+
+
+def load_fixture_json(name, filename):
+    with open(fixture_file(name, filename), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def install_claude_fixture(cfg, name, limit=None):
+    src = fixture_file(name, "session.jsonl")
+    dst = os.path.join(cfg.claude_root, "shop", "session.jsonl")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(src, encoding="utf-8") as f:
+        lines = f.readlines()
+    with open(dst, "w", encoding="utf-8") as f:
+        f.writelines(lines[:limit] if limit else lines)
+    return dst
+
+
+def install_codex_fixture(cfg, name, limit=None):
+    src = fixture_file(name, "session.jsonl")
+    dst = os.path.join(cfg.codex_root, "pet", "session.jsonl")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(src, encoding="utf-8") as f:
+        lines = f.readlines()
+    with open(dst, "w", encoding="utf-8") as f:
+        f.writelines(lines[:limit] if limit else lines)
+    return dst
+
+
+def read_fixture_lines(name):
+    with open(fixture_file(name, "session.jsonl"), encoding="utf-8") as f:
+        return f.readlines()
+
+
+def run_with_replay(cfg, replay_obj):
+    with mock.patch.object(sd, "call_llm", new=replay_obj):
+        return sd._run_nightly(cfg, dry=False)
+
+
+class TestGoldenFixtures(unittest.TestCase):
+    def test_all_replays_validate_against_prompt_version(self):
+        for name in ("basic_claude", "incremental_codex",
+                     "adversarial_merge"):
+            data = replay.load_replay(fixture_file(name, "llm_replay.json"))
+            self.assertEqual(data["prompt_version"], sd.PROMPT_VERSION)
+            self.assertTrue(data["entries"])
+            for entry in data["entries"]:
+                self.assertIn(entry["mode"],
+                              ("full", "incremental", "merge"))
+
+    def test_expected_files_are_json(self):
+        for name in ("basic_claude", "incremental_codex",
+                     "adversarial_merge"):
+            expected = load_fixture_json(name, "expected.json")
+            self.assertIsInstance(expected.get("expected_facts")
+                                  or expected.get("expected_full_facts"), dict)
+            self.assertIn("forbidden_strings", expected)
+
+    def test_prompt_version_mismatch_is_rejected(self):
+        data = load_fixture_json("basic_claude", "llm_replay.json")
+        data["prompt_version"] = sd.PROMPT_VERSION - 1
+        with self.assertRaises(replay.ReplayError):
+            replay.validate_replay(data)
+
+    def test_basic_recorded_response_matches_reviewed_snapshot(self):
+        data = replay.load_replay(fixture_file("basic_claude",
+                                               "llm_replay.json"))
+        self.assertEqual(data["kind"], "recorded")
+        self.assertTrue(data["model"])
+        self.assertTrue(data["recorded_at"])
+        with open(fixture_file("basic_claude", "expected_summary.md"),
+                  encoding="utf-8") as f:
+            reviewed = f.read()
+        self.assertEqual(data["entries"][0]["response"].strip(),
+                         reviewed.strip())
+
+
+class TestGoldenPipeline(unittest.TestCase):
+    def test_basic_claude_full_pipeline_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path = install_claude_fixture(cfg, "basic_claude")
+            info = sd.parse_session(path, "claude")
+            key = sd.session_key(info, path)
+            replay_obj = replay.ReplayLLM(
+                fixture_file("basic_claude", "llm_replay.json"))
+
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+
+            state = sd.load_state(cfg)
+            entry = state[key]
+            self.assertEqual(entry["offset"], os.path.getsize(path))
+            self.assertEqual(entry["sections"], 0)
+            self.assertIn("digest_facts", entry)
+            self.assertEqual(len(replay_obj.calls), 1)
+
+            summary = open(sd.obsidian_path(cfg, info, key),
+                           encoding="utf-8").read()
+            expected = load_fixture_json("basic_claude", "expected.json")
+            score = replay.score_summary(summary, expected)
+            self.assertTrue(score["ok"], score)
+            self.assertEqual(score["fabricated"], [])
+            self.assertEqual(score["foreign"], [])
+            concl = replay.check_conclusions(summary, expected)
+            self.assertTrue(concl["ok"], concl)
+            names = [n for n, _ in sd._summary_sections(summary)]
+            for heading in ("这一段在做什么", "走过的路", "关键标识符",
+                            "还没完的事"):
+                self.assertTrue(any(heading in n for n in names), names)
+            self.assertNotIn("⚠", summary)
+            self.assertNotIn("助手提到", summary)
+
+            index = sd.load_index(cfg)
+            self.assertEqual(index["sessions"][key]["prompt_version"],
+                             sd.PROMPT_VERSION)
+
+    def test_basic_claude_rerun_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path = install_claude_fixture(cfg, "basic_claude")
+            info = sd.parse_session(path, "claude")
+            key = sd.session_key(info, path)
+            replay_obj = replay.ReplayLLM(
+                fixture_file("basic_claude", "llm_replay.json"))
+            run_with_replay(cfg, replay_obj)
+            spath = sd.obsidian_path(cfg, info, key)
+            with open(spath, "rb") as f:
+                before = f.read()
+            offset_before = sd.load_state(cfg)[key]["offset"]
+
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+            self.assertEqual(len(replay_obj.calls), 1)
+            with open(spath, "rb") as f:
+                self.assertEqual(f.read(), before)
+            self.assertEqual(sd.load_state(cfg)[key]["offset"], offset_before)
+
+    def test_incremental_codex_appends_then_merges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            split = load_fixture_json("incremental_codex",
+                                      "expected.json")["split_after"]
+            path = install_codex_fixture(cfg, "incremental_codex", limit=split)
+            info = sd.parse_session(path, "codex")
+            key = sd.session_key(info, path)
+            replay_obj = replay.ReplayLLM(
+                fixture_file("incremental_codex", "llm_replay.json"))
+
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+            state = sd.load_state(cfg)
+            self.assertEqual(state[key]["sections"], 0)
+
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(read_fixture_lines("incremental_codex")[split:])
+            size = os.path.getsize(path)
+
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+            state = sd.load_state(cfg)
+            self.assertEqual(state[key]["sections"], 1)
+            self.assertEqual(state[key]["offset"], size)
+            spath = sd.obsidian_path(cfg, info, key)
+            summary = open(spath, encoding="utf-8").read()
+            self.assertEqual(summary.count("<!-- sd:cont"), 1)
+            self.assertIn("npm run build:prod", summary)
+            self.assertIn("devicePixelRatio", summary)
+
+            # 把状态标成已续写三次，下一轮应进入合并
+            state[key]["sections"] = cfg.merge_after
+            sd.save_state(cfg, state)
+            self.assertEqual(run_with_replay(cfg, replay_obj), 0)
+            state = sd.load_state(cfg)
+            self.assertEqual(state[key]["sections"], 0)
+            merged = open(spath, encoding="utf-8").read()
+            self.assertIn("npm run build", merged)
+            self.assertIn("npm run build:prod", merged)
+            self.assertIn("devicePixelRatio", merged)
+            self.assertIn("4K", merged)
+            self.assertNotIn("<!-- sd:cont", merged)
+            self.assertNotIn("## 续", merged)
+            names = [n for n, _ in sd._summary_sections(merged)]
+            for heading in ("这一段在做什么", "走过的路", "关键标识符",
+                            "还没完的事"):
+                self.assertTrue(any(heading in n for n in names), names)
+            self.assertNotIn("⚠", merged)
+            self.assertEqual([c["mode"] for c in replay_obj.calls],
+                             ["full", "incremental", "merge"])
+
+            expected = load_fixture_json("incremental_codex", "expected.json")
+            score = replay.score_summary(merged, expected)
+            self.assertTrue(score["ok"], score)
+
+
+class TestGoldenQualitySnapshot(unittest.TestCase):
+    def test_recorded_response_passes_golden_detectors(self):
+        """记录响应的快照，不是对模型普遍质量的结论。"""
+        data = replay.load_replay(fixture_file("basic_claude",
+                                               "llm_replay.json"))
+        response = data["entries"][0]["response"]
+        expected = load_fixture_json("basic_claude", "expected.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path = install_claude_fixture(cfg, "basic_claude")
+            info = sd.parse_session(path, "claude")
+            checked = sd.checked_summary(cfg, response, info)
+
+        score = replay.score_summary(checked, expected)
+        self.assertTrue(score["ok"], score)
+        concl = replay.check_conclusions(checked, expected)
+        self.assertTrue(concl["ok"], concl)
+        self.assertEqual(replay.certainty_overreach(checked), 0)
+        self.assertNotIn("⚠", checked)
+
+
+class TestGoldenSemanticErrors(unittest.TestCase):
+    def setUp(self):
+        self.expected = load_fixture_json("basic_claude", "expected.json")
+        self.recorded = replay.load_replay(
+            fixture_file("basic_claude", "llm_replay.json"))["entries"][0]["response"]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.cfg = make_cfg(tmp)
+            path = install_claude_fixture(self.cfg, "basic_claude")
+            self.info = sd.parse_session(path, "claude")
+
+    def test_key_fact_omission_detected(self):
+        summary = self.recorded.replace("src/export.py", "")
+        score = replay.score_summary(summary, self.expected)
+        self.assertIn("paths:src/export.py", score["missing"])
+        self.assertFalse(score["ok"])
+
+    def test_fabricated_fact_marked(self):
+        summary = (self.recorded +
+                   "\n\n## 关键标识符\n- 路径：`/missing/fabricated.py`\n")
+        marked = sd.verify_summary(summary, self.info)
+        self.assertIn("`/missing/fabricated.py` ⚠", marked)
+        score = replay.score_summary(marked, self.expected)
+        self.assertEqual(score["fabricated"], ["/missing/fabricated.py"])
+
+    def test_todo_marked_done_detected(self):
+        expected = {"key_conclusions": [{
+            "id": "mem-test",
+            "require": ["大文件内存占用"],
+            "status": "completed",
+        }]}
+        summary = "## 还没完的事\n- 大文件内存占用还没测。\n"
+        result = replay.check_conclusions(summary, expected)
+        self.assertIn("mem-test", result["status_mismatch"])
+        self.assertFalse(result["ok"])
+
+    def test_speculation_as_fact_detected(self):
+        info = sd._blank_info("claude")
+        info["prompts"] = ["改 /a/b.py，修好它"]
+        summary = ("## 关键标识符\n"
+                   "- 路径：`/missing/fabricated.py` 已修复。\n"
+                   "## 还没完的事\n- 无\n")
+        marked = sd.verify_summary(summary, info)
+        self.assertIn("⚠", marked)
+        self.assertIn("⚠?", marked)
+        self.assertEqual(replay.certainty_overreach(marked), 1)
+
+    def test_superseded_decision_as_current_detected(self):
+        expected = {"key_conclusions": [{
+            "id": "redis-superseded",
+            "require": ["Redis"],
+            "status": "superseded",
+            "forbid": ["目前仍然"],
+        }]}
+        summary = "## 这一段在做什么\n目前仍然继续用 Redis。\n"
+        result = replay.check_conclusions(summary, expected)
+        self.assertIn("redis-superseded", result["stale_decision"])
+        self.assertFalse(result["ok"])
+
+    def test_cross_project_fact_detected(self):
+        summary = (self.recorded +
+                   "\n\n## 关键标识符\n- 路径：`other-project/api.py`\n")
+        score = replay.score_summary(summary, self.expected)
+        self.assertIn("other-project/api.py", score["foreign"])
+        marked = sd.verify_summary(summary, self.info)
+        self.assertIn("`other-project/api.py` ⚠", marked)
+
+    def test_reason_loss_detected(self):
+        expected = load_fixture_json("adversarial_merge", "expected.json")
+        summary = ("## 这一段在做什么\n"
+                   "在 shop 项目里暂不换用 Redis，继续用本地文件缓存。\n")
+        result = replay.check_conclusions(summary, expected)
+        self.assertIn("no-redis", result["missing_reason"])
+        self.assertNotIn("no-redis", result["missing_statement"])
+
+    def test_merge_loss_check_flags_reason_loss(self):
+        replay_data = replay.load_replay(
+            fixture_file("adversarial_merge", "llm_replay.json"))
+        full = replay_data["entries"][0]["response"]
+        bad_merge = replay_data["entries"][1]["response"]
+        old_facts = sd.extract_conclusions(full)
+        lost = replay.merge_loss_check(old_facts, bad_merge)
+        self.assertTrue(any("原因" in item for item in lost), lost)
+
+    def test_merge_rejects_conclusion_loss_without_touching_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            path = install_claude_fixture(cfg, "adversarial_merge")
+            info = sd.parse_session(path, "claude")
+            key = sd.session_key(info, path)
+            replay_data = replay.load_replay(
+                fixture_file("adversarial_merge", "llm_replay.json"))
+            full = replay_data["entries"][0]["response"]
+            sd.write_full(cfg, info, "shop", full, key)
+            spath = sd.obsidian_path(cfg, info, key)
+            sd.update_index(cfg, info, "shop", full, key, path, "full")
+            with open(spath, "rb") as f:
+                before = f.read()
+            size = os.path.getsize(path)
+            sd.save_state(cfg, {key: {
+                "offset": size,
+                "prefix_sha1": sd.prefix_sha1(path, size),
+                "sections": 3,
+                "first_date": info.get("start"),
+                "first_title": sd.title_of(info),
+                "digest_facts": sd.extract_conclusions(full),
+                "merge_rejections": 0,
+            }})
+
+            replay_obj = replay.ReplayLLM(replay_data)
+            self.assertEqual(run_with_replay(cfg, replay_obj), 1)
+
+            with open(spath, "rb") as f:
+                self.assertEqual(f.read(), before)
+            state = sd.load_state(cfg)
+            self.assertEqual(state[key]["sections"], 3)
+            self.assertEqual(state[key]["merge_rejections"], 1)
+            failures = sd.load_failures(cfg)
+            self.assertIn("原因", failures[key]["error"])
+            self.assertIn("部署环境", failures[key]["error"])
 
 
 if __name__ == "__main__":

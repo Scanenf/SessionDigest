@@ -1,0 +1,24 @@
+{
+  "project": "shop",
+  "expected_facts": {
+    "paths": ["src/cache.py", "src/auth.py"],
+    "commands": [],
+    "decisions": ["Redis", "本地文件缓存"],
+    "open_items": ["API 超时重试"]
+  },
+  "key_conclusions": [
+    {
+      "id": "no-redis",
+      "statement": "暂不换用 Redis",
+      "reason": "部署环境没有 Redis",
+      "status": "active",
+      "source": "prompt#1",
+      "require": ["Redis", "本地文件缓存"],
+      "require_reason": ["部署环境", "没有 Redis"],
+      "forbid": ["已经换成 Redis", "现在使用 Redis"]
+    }
+  ],
+  "forbidden_facts": ["/missing/fabricated.py", "src/legacy.py"],
+  "foreign_facts": ["other-project/api.py"],
+  "forbidden_strings": ["sk-ant-", "C:/Users/alice", "alice"]
+}
