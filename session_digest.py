@@ -8,6 +8,7 @@ SessionDigest — 把 Claude Code / Codex 的本地会话记录蒸馏成结构�
   --llm N         预览：对最近 N 场会话生成摘要
   --nightly       增量：新会话全量摘要，旧会话只摘要新增部分并追加「续」段
   --context N     输出最近 N 份摘要拼接文本
+  --find 关键词   按相关度查找历史摘要（本地关键词匹配）
   --retry-failed  只重试失败队列
 
 隐私提示：
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -49,10 +50,12 @@ class Config:
     state_file: str
     index_file: str
     failures_file: str
+    lock_file: str
     projects: Dict[str, str]
     base_url: str
     api_key: Optional[str]
     model: str
+    api_format: str = "anthropic"
     min_turns: int = 8
     min_age_hours: int = 6
     max_sessions: int = 20
@@ -99,11 +102,15 @@ def load_projects(path: Optional[str]) -> Dict[str, str]:
 
 
 def resolve_llm(args) -> Tuple[str, Optional[str], str]:
+    fmt = getattr(args, "api_format", None) or "anthropic"
     base = args.base_url or os.environ.get("ANTHROPIC_BASE_URL")
     tok = (args.api_key
            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-           or os.environ.get("ANTHROPIC_API_KEY"))
+           or os.environ.get("ANTHROPIC_API_KEY")
+           or (os.environ.get("OPENAI_API_KEY") if fmt == "openai" else None))
     model = args.model or os.environ.get("ANTHROPIC_MODEL")
+    if fmt == "openai":
+        model = model or os.environ.get("OPENAI_MODEL")
 
     if not (base and tok):
         try:
@@ -116,7 +123,91 @@ def resolve_llm(args) -> Tuple[str, Optional[str], str]:
         except Exception:
             pass
 
+    if fmt == "openai":
+        return (base or "https://api.openai.com").rstrip("/"), tok, model or ""
     return (base or "https://api.anthropic.com").rstrip("/"), tok, (model or "claude-sonnet-5-5")
+
+
+# ---------------------------------------------------------------------------
+# 进程锁与原子写入
+# ---------------------------------------------------------------------------
+
+class ProcessLock:
+    """跨平台非阻塞互斥锁：同一时间只允许一个写入进程。
+
+    用操作系统的文件锁（Windows: msvcrt，POSIX: fcntl），进程退出或崩溃时
+    由系统自动释放，不会留下需要手工清理的死锁文件。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fh = None
+
+    def acquire(self) -> bool:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        fh = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    fh.write(b"\n")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self.fh = fh
+        return True
+
+    def release(self) -> None:
+        fh, self.fh = self.fh, None
+        if not fh:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def write_text_atomic(path: str, text: str) -> None:
+    """先写临时文件再替换，避免进程中断留下半截文件。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def lock_or_report(cfg: Config) -> Optional[ProcessLock]:
+    """拿写锁；被占用时打印提示并返回 None。"""
+    lock = ProcessLock(cfg.lock_file)
+    if lock.acquire():
+        return lock
+    print(f"另一个 SessionDigest 进程正在运行（锁：{cfg.lock_file}）。\n"
+          f"等它结束后再试；如果确认没有进程在跑，删掉该文件即可。",
+          file=sys.stderr)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -618,11 +709,48 @@ def merge_prompt(prev_summary: str) -> str:
 """
 
 
+def api_endpoint(cfg: Config) -> str:
+    """按接口格式拼出请求地址；OpenAI 兼容端点可能已带 /v1。"""
+    base = cfg.base_url.rstrip("/")
+    if cfg.api_format == "openai":
+        return base + ("/chat/completions" if re.search(r"/v\d+$", base)
+                       else "/v1/chat/completions")
+    return base + "/v1/messages"
+
+
+def _parse_response(fmt: str, d: dict) -> Tuple[str, dict, bool]:
+    if not isinstance(d, dict):
+        raise RuntimeError("模型端点返回的 JSON 不是对象")
+    if fmt == "openai":
+        choices = d.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"OpenAI 兼容响应缺少 choices：{str(d)[:200]}")
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            text = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        else:
+            text = content or ""
+        u = d.get("usage") or {}
+        usage = {"input_tokens": u.get("prompt_tokens"),
+                 "output_tokens": u.get("completion_tokens")}
+        return str(text).strip(), usage, choices[0].get("finish_reason") == "length"
+
+    text = "".join(b.get("text", "") for b in d.get("content", [])
+                   if isinstance(b, dict) and b.get("type") == "text").strip()
+    return text, d.get("usage") or {}, d.get("stop_reason") == "max_tokens"
+
+
 def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 300):
     if not cfg.api_key:
         raise RuntimeError(
             "缺少 API key：请设置 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY，"
             "或传入 --api-key")
+    fmt = cfg.api_format if cfg.api_format in ("anthropic", "openai") else "anthropic"
+    if fmt == "openai" and not cfg.model:
+        raise RuntimeError(
+            "OpenAI 兼容模式需要指定模型：--model 或环境变量 OPENAI_MODEL")
+    url = api_endpoint(cfg)
     last_err = None
     for net_attempt in range(2):
         body = json.dumps({
@@ -630,34 +758,51 @@ def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 30
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }).encode("utf-8")
-        req = urllib.request.Request(
-            cfg.base_url + "/v1/messages", data=body, method="POST",
-            headers={
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": cfg.api_key,
-                "authorization": "Bearer " + cfg.api_key,
-            })
+        headers = {"content-type": "application/json",
+                   "authorization": "Bearer " + cfg.api_key}
+        if fmt == "anthropic":
+            headers.update({"anthropic-version": "2023-06-01",
+                            "x-api-key": cfg.api_key})
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                raw = r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                detail = ""
+            if e.code in (408, 429, 500, 502, 503, 504) and net_attempt == 0:
+                last_err = e
+                time.sleep(2)
+                continue
+            raise RuntimeError(
+                f"模型端点返回 HTTP {e.code}：{detail or e.reason}\n"
+                f"当前接口格式：{fmt}（{url}）。如果这是自定义地址，"
+                f"确认 --api-format 与端点格式一致。") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             last_err = e
             if net_attempt == 0:
                 time.sleep(2)
                 continue
-            raise
+            raise RuntimeError(f"请求失败：{e}") from e
 
-        text = "".join(b.get("text", "") for b in d.get("content", [])
-                       if b.get("type") == "text").strip()
-        usage = d.get("usage") or {}
+        try:
+            d = json.loads(raw)
+        except ValueError as e:
+            raise RuntimeError(
+                f"模型端点返回的不是 JSON（当前按 {fmt} 格式请求 {url}）："
+                f"{raw[:200]}") from e
+
+        text, usage, truncated = _parse_response(fmt, d)
         if text:
             return text, usage
-        if d.get("stop_reason") == "max_tokens" and max_tokens < 32000:
+        if truncated and max_tokens < 32000:
             max_tokens *= 2
             continue
-        raise RuntimeError(f"模型未返回文本: stop_reason={d.get('stop_reason')}")
-    raise RuntimeError(f"请求失败: {last_err}")
+        raise RuntimeError(f"模型未返回文本（{fmt}）：{raw[:200]}")
+    raise RuntimeError(f"请求失败：{last_err}")
 
 
 def summarize_one(cfg: Config, info: dict, label: str):
@@ -775,9 +920,7 @@ def obsidian_doc(info: dict, label: str, text: str, sid: str) -> str:
 def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Optional[str]:
     path = obsidian_path(cfg, info, sid)
     if path:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(obsidian_doc(info, label, text, sid))
+        write_text_atomic(path, obsidian_doc(info, label, text, sid))
 
     month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
     if cfg.memory_dir:
@@ -790,8 +933,7 @@ def write_full(cfg: Config, info: dict, label: str, text: str, sid: str) -> Opti
         except Exception:
             cur = f"# {month} 会话摘要\n\n> 自动生成。原文可在本地会话记录中检索。\n"
         cur = replace_block(cur, sid, monthly_block(month, info, label, text, sid))
-        with open(mpath, "w", encoding="utf-8") as f:
-            f.write(cur)
+        write_text_atomic(mpath, cur)
         update_memory_index(cfg, month)
     return path
 
@@ -800,14 +942,14 @@ def append_continuation(cfg: Config, info: dict, label: str, text: str,
                         sid: str, prev_summary: str) -> Optional[str]:
     path = obsidian_path(cfg, info, sid)
     if path:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.exists(path):
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n" + text.strip() + "\n")
+            with open(path, encoding="utf-8") as fh:
+                cur = fh.read()
+            write_text_atomic(path, cur.rstrip("\n") + "\n\n" + text.strip() + "\n")
         else:
             # 文件丢失时，用旧摘要 + 续段重建
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(obsidian_doc(info, label, prev_summary.rstrip() + "\n\n" + text, sid))
+            write_text_atomic(path, obsidian_doc(
+                info, label, prev_summary.rstrip() + "\n\n" + text, sid))
 
     month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
     if cfg.memory_dir:
@@ -826,8 +968,7 @@ def append_continuation(cfg: Config, info: dict, label: str, text: str,
                 cur, sid,
                 monthly_block(month, info, label,
                               prev_summary.rstrip() + "\n\n" + text, sid))
-        with open(mpath, "w", encoding="utf-8") as f:
-            f.write(cur)
+        write_text_atomic(mpath, cur)
         update_memory_index(cfg, month)
     return path
 
@@ -846,8 +987,7 @@ def update_memory_index(cfg: Config, month: str) -> bool:
         return False
     if cur and not cur.endswith("\n"):
         cur += "\n"
-    with open(idx, "w", encoding="utf-8") as f:
-        f.write(cur + line + "\n")
+    write_text_atomic(idx, cur + line + "\n")
     return True
 
 
@@ -892,11 +1032,8 @@ def load_index(cfg: Config) -> dict:
 
 
 def save_index(cfg: Config, index: dict) -> None:
-    os.makedirs(os.path.dirname(cfg.index_file) or ".", exist_ok=True)
-    tmp = cfg.index_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, cfg.index_file)
+    write_text_atomic(cfg.index_file,
+                      json.dumps(index, ensure_ascii=False, indent=1))
 
 
 def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
@@ -931,11 +1068,8 @@ def load_failures(cfg: Config) -> dict:
 
 
 def save_failures(cfg: Config, failures: dict) -> None:
-    os.makedirs(os.path.dirname(cfg.failures_file) or ".", exist_ok=True)
-    tmp = cfg.failures_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(failures, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, cfg.failures_file)
+    write_text_atomic(cfg.failures_file,
+                      json.dumps(failures, ensure_ascii=False, indent=1))
 
 
 def record_failure(cfg: Config, key: str, path: str, error: str,
@@ -974,11 +1108,8 @@ def load_state(cfg: Config) -> dict:
 
 
 def save_state(cfg: Config, state: dict) -> None:
-    os.makedirs(os.path.dirname(cfg.state_file) or ".", exist_ok=True)
-    tmp = cfg.state_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, cfg.state_file)
+    write_text_atomic(cfg.state_file,
+                      json.dumps(state, ensure_ascii=False, indent=1))
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1390,18 @@ def cmd_nightly(cfg: Config, dry: bool) -> int:
         print("错误：--nightly 需要至少一个输出目录：--memory-dir 或 --obsidian-dir",
               file=sys.stderr)
         return 2
+    if dry:
+        return _run_nightly(cfg, dry)
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        return _run_nightly(cfg, dry)
+    finally:
+        lock.release()
 
+
+def _run_nightly(cfg: Config, dry: bool) -> int:
     state = load_state(cfg)
     failures = load_failures(cfg)
     retry = [k for k, v in failures.items() if int(v.get("attempts", 0)) < 3]
@@ -1314,7 +1456,16 @@ def cmd_retry_failed(cfg: Config, dry: bool) -> int:
         for key, v in failures.items():
             print(f"  {key[:8]} · 尝试 {v.get('attempts', 0)} 次 · {v.get('error', '')[:80]}")
         return 0
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        return _run_retry_failed(cfg, failures)
+    finally:
+        lock.release()
 
+
+def _run_retry_failed(cfg: Config, failures: dict) -> int:
     state = load_state(cfg)
     done = 0
     for key, v in list(failures.items()):
@@ -1336,6 +1487,138 @@ def cmd_retry_failed(cfg: Config, dry: bool) -> int:
     return 0 if done == len(failures) else 1
 
 
+def summary_text(cfg: Config, rec: dict) -> str:
+    """从索引记录里读回一份摘要的正文（去掉 frontmatter）。"""
+    path = rec.get("file")
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except Exception:
+        return ""
+    monthly_root = os.path.normpath(
+        os.path.join(cfg.memory_dir, "sessions")) if cfg.memory_dir else ""
+    is_monthly = monthly_root and os.path.normpath(path).startswith(monthly_root)
+    text = block_text(raw, rec.get("sid", "")) if is_monthly \
+        else strip_frontmatter(raw)
+    # 顺手去掉正文开头的一级标题，避免和输出里的“## 日期 · 项目”重复
+    return re.sub(r"^\s*# [^\n]*\n+", "", text, count=1)
+
+
+# 中文用相邻二字切词（不依赖分词库），英文/数字按词切
+_CJK_CLASS = "[㐀-鿿]"
+_WORD_RE = re.compile(r"[a-z0-9_][a-z0-9_./-]*")
+_CJK_RUN_RE = re.compile(f"{_CJK_CLASS}+")
+
+
+def text_tokens(text: str) -> set:
+    text = (text or "").lower()
+    toks = {t for t in _WORD_RE.findall(text) if len(t) >= 2}
+    for run in _CJK_RUN_RE.findall(text):
+        if len(run) == 1:
+            toks.add(run)
+        else:
+            toks.update(run[i:i + 2] for i in range(len(run) - 1))
+    return toks
+
+
+def _frontmatter_value(raw: str, key: str) -> str:
+    m = re.search(rf"^{key}: *(.*)$", raw, re.M)
+    v = (m.group(1) or "").strip() if m else ""
+    return v.strip('"').strip("'")
+
+
+def _docs_from_vault(cfg: Config) -> List[dict]:
+    """索引缺失时，直接从 Obsidian 目录恢复候选列表。"""
+    docs = []
+    if not cfg.obsidian_dir or not os.path.isdir(cfg.obsidian_dir):
+        return docs
+    for path in glob.glob(os.path.join(cfg.obsidian_dir, "*", "*.md")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+        except Exception:
+            continue
+        docs.append({
+            "sid": _frontmatter_value(raw, "session"),
+            "date": _frontmatter_value(raw, "date"),
+            "project": _frontmatter_value(raw, "project"),
+            "title": _frontmatter_value(raw, "title"),
+            "file": path,
+        })
+    return docs
+
+
+def search_summaries(cfg: Config, query: str, top: int,
+                     project: Optional[str]) -> List[dict]:
+    """按关键词相关度排序，返回 top 条带 score 的记录。"""
+    q = text_tokens(query)
+    if not q:
+        return []
+    index = load_index(cfg)
+    recs = list(index["sessions"].values())
+    if not recs:
+        recs = _docs_from_vault(cfg)
+    if project:
+        recs = [r for r in recs if project.lower() in str(r.get("project", "")).lower()]
+
+    docs = []
+    for rec in recs:
+        text = summary_text(cfg, rec)
+        if not text:
+            continue
+        head = f"{rec.get('title', '')} {rec.get('project', '')}"
+        docs.append({"rec": rec, "text": text,
+                     "head_tokens": text_tokens(head),
+                     "body_tokens": text_tokens(text)})
+    if not docs:
+        return []
+
+    n = len(docs)
+    idf = {}
+    for t in q:
+        df = sum(1 for d in docs if t in d["head_tokens"] or t in d["body_tokens"])
+        idf[t] = 1.0 + (n / df if df else 0) ** 0.5
+
+    scored = []
+    for d in docs:
+        score, hits = 0.0, []
+        for t in q:
+            if t in d["head_tokens"]:
+                score += 3.0 * idf[t]
+                hits.append(t)
+            elif t in d["body_tokens"]:
+                score += idf[t]
+                hits.append(t)
+        if score > 0:
+            scored.append({"rec": d["rec"], "text": d["text"],
+                           "score": score, "hits": hits})
+    scored.sort(key=lambda x: (x["score"], x["rec"].get("date") or ""), reverse=True)
+    return scored[:top]
+
+
+def cmd_find(cfg: Config, query: str, top: int, project: Optional[str]) -> int:
+    if not text_tokens(query):
+        print("查询词太短：至少给一个中文词或两个以上字母/数字。", file=sys.stderr)
+        return 2
+    results = search_summaries(cfg, query, top, project)
+    if not results:
+        print(f"没有找到与「{query}」相关的摘要。", file=sys.stderr)
+        print("提示：这是关键词匹配，不是语义检索；换个更具体的词试试，"
+              "或者先跑 --nightly 生成摘要。", file=sys.stderr)
+        return 1
+    print(f"# 与「{query}」相关的 {len(results)} 份摘要\n")
+    for r in results:
+        rec = r["rec"]
+        print(f"## {str(rec.get('date', ''))[:10]} · {rec.get('project', '')} · "
+              f"{rec.get('title', '')}  （相关度 {r['score']:.1f}）")
+        print()
+        print(r["text"].strip())
+        print("\n---")
+    return 0
+
+
 def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
     index = load_index(cfg)
     items = list(index["sessions"].values())
@@ -1348,19 +1631,7 @@ def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
         return 1
 
     for v in items:
-        path = v.get("file")
-        text = ""
-        if path and os.path.exists(path):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    raw = fh.read()
-                monthly_root = os.path.normpath(
-                    os.path.join(cfg.memory_dir, "sessions")) if cfg.memory_dir else ""
-                is_monthly = monthly_root and os.path.normpath(path).startswith(monthly_root)
-                text = block_text(raw, v.get("sid", "")) if is_monthly \
-                    else strip_frontmatter(raw)
-            except Exception:
-                text = ""
+        text = summary_text(cfg, v)
         print(f"\n## {v.get('date', '')[:10]} · {v.get('project', '')} · {v.get('title', '')}")
         print()
         print(text.strip() or "（摘要文件缺失）")
@@ -1369,6 +1640,16 @@ def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
 
 
 def cmd_export(cfg: Config) -> int:
+    lock = lock_or_report(cfg)
+    if lock is None:
+        return 1
+    try:
+        return _run_export(cfg)
+    finally:
+        lock.release()
+
+
+def _run_export(cfg: Config) -> int:
     idx = {"claude": OrderedDict(), "codex": OrderedDict()}
     total = 0
     index = load_index(cfg)
@@ -1473,10 +1754,12 @@ def build_config(args) -> Config:
         state_file=state_file,
         index_file=_expand(args.index_file) or os.path.join(sdir, "index.json"),
         failures_file=_expand(args.failures_file) or os.path.join(sdir, "failures.json"),
+        lock_file=_expand(args.lock_file) or state_file + ".lock",
         projects=load_projects(args.projects_file),
         base_url=base_url,
         api_key=api_key,
         model=model,
+        api_format=args.api_format,
         min_turns=args.min_turns,
         min_age_hours=args.min_age_hours,
         max_sessions=args.max_sessions,
@@ -1503,7 +1786,8 @@ def main(argv=None) -> int:
                "  python session_digest.py --export\n"
                "  python session_digest.py --llm 3 --dry-run\n"
                "  python session_digest.py --nightly --obsidian-dir ~/vault/摘要\n"
-               "  python session_digest.py --context 5 --project shop\n")
+               "  python session_digest.py --context 5 --project shop\n"
+               "  python session_digest.py --find \"库存 架构\"\n")
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     mode = ap.add_mutually_exclusive_group()
@@ -1511,9 +1795,11 @@ def main(argv=None) -> int:
     mode.add_argument("--llm", type=int, metavar="N", help="预览：对最近 N 场会话生成摘要")
     mode.add_argument("--nightly", action="store_true", help="增量提炼新会话")
     mode.add_argument("--context", type=int, metavar="N", help="输出最近 N 份摘要的拼接文本")
+    mode.add_argument("--find", metavar="QUERY", help="按关键词查找相关摘要（本地匹配）")
     mode.add_argument("--retry-failed", action="store_true", help="只重试失败队列")
 
-    ap.add_argument("--project", default=None, help="--context 时按项目名过滤")
+    ap.add_argument("--top", type=int, default=3, help="--find 返回几条（默认 3）")
+    ap.add_argument("--project", default=None, help="--context / --find 时按项目名过滤")
     ap.add_argument("--claude-root", default=None,
                     help="Claude Code 会话目录（默认 ~/.claude/projects）")
     ap.add_argument("--codex-root", default=None,
@@ -1525,12 +1811,17 @@ def main(argv=None) -> int:
                     help="去重与偏移状态（默认 ~/.claude-session-digest/state.json）")
     ap.add_argument("--index-file", default=None, help="索引 JSON（默认与 state 同目录）")
     ap.add_argument("--failures-file", default=None, help="失败队列 JSON（默认与 state 同目录）")
+    ap.add_argument("--lock-file", default=None,
+                    help="进程锁文件（默认 state 文件后加 .lock）")
     ap.add_argument("--projects-file", default=None,
                     help="项目名映射 JSON，如 {\"my-repo\": \"我的项目\"}")
 
     ap.add_argument("--base-url", default=None, help="模型 API 地址")
     ap.add_argument("--api-key", default=None, help="模型 API key（也可用环境变量）")
-    ap.add_argument("--model", default=None, help="模型名（默认 claude-sonnet-5-5）")
+    ap.add_argument("--model", default=None,
+                    help="模型名（Anthropic 默认 claude-sonnet-5-5；OpenAI 兼容模式必须指定）")
+    ap.add_argument("--api-format", choices=["anthropic", "openai"], default="anthropic",
+                    help="接口格式：anthropic（/v1/messages）或 openai（/chat/completions）")
 
     ap.add_argument("--min-turns", type=int, default=8,
                     help="新会话少于 N 条消息时跳过（默认 8）")
@@ -1552,7 +1843,8 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true", help="失败时打印完整堆栈")
 
     args = ap.parse_args(argv)
-    if not (args.export or args.llm or args.nightly or args.context or args.retry_failed):
+    if not (args.export or args.llm or args.nightly or args.context
+            or args.find or args.retry_failed):
         ap.print_help()
         return 0
 
@@ -1563,6 +1855,8 @@ def main(argv=None) -> int:
         return cmd_preview(cfg, args.llm, args.dry_run)
     if args.context:
         return cmd_context(cfg, args.context, args.project)
+    if args.find:
+        return cmd_find(cfg, args.find, max(1, args.top), args.project)
     if args.retry_failed:
         return cmd_retry_failed(cfg, args.dry_run)
     return cmd_nightly(cfg, args.dry_run)

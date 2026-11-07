@@ -41,7 +41,8 @@
 
 ## 它不是什么
 
-- 不是检索工具。要搜原文，用 ripgrep 或专门的会话检索工具。
+- 不是检索工具。`--find` 只是在摘要里做关键词匹配；要搜原文或做语义检索，
+  用 ripgrep、deja-vu 这类专门工具。
 - 不是自动注入。它不会在开场把内容塞进上下文——由你决定什么时候读。
 - 不是云端服务。所有文件都在本地。
 
@@ -71,10 +72,11 @@
    这不是功能缺失，是取舍：不做悄悄消耗 token 的事。
 
 如果你要的是“装完就忘、自动带上下文”，用 claude-mem；
-要完整的可读归档，用 claude-code-log；要搜历史，用 deja-vu。
+要完整的可读归档，用 claude-code-log；要在所有会话原文里做语义检索，用 deja-vu
+（本项目的 `--find` 只匹配摘要关键词）。
 它们和本项目可以同时装，不冲突。
 
-## 四种模式
+## 五种模式
 
 | 模式 | 调用模型 | 输出 | 用途 |
 |---|---|---|---|
@@ -82,6 +84,7 @@
 | `--llm N` | 是 | 临时目录里的 N 份摘要 | 试效果、调 prompt |
 | `--nightly` | 是 | `memory/` 与 Obsidian，增量续写 | 挂定时任务长期跑 |
 | `--context N` | 否 | 最近 N 份摘要的拼接文本 | 手动喂给下一次会话 |
+| `--find 关键词` | 否 | 相关度最高的 N 份摘要 | 按问题找历史 |
 
 ## 增量续写
 
@@ -106,6 +109,24 @@
 
 这不能消灭幻觉，但能让你一眼看出哪些条目需要核对。用 `--no-verify` 关闭校验。
 
+## 按问题找历史
+
+`--context` 是“最近 N 场”，`--find` 才是“和这个问题有关的”：
+
+```bash
+python session_digest.py --find "库存 架构"
+python session_digest.py --find "中文文件名 乱码" --top 5 --project shop
+```
+
+它在本地的摘要文本里做关键词打分：中文按相邻二字切词，英文按词切分，
+标题权重是正文的三倍，再按词频稀有度加权。不调用模型、不上传任何内容。
+
+**说清楚它是什么**：关键词匹配，不是语义检索。问“之前为什么改架构”，
+它找的是包含“架构”“改”“为什么”这些词的摘要；换个说法（比如“重构的原因”）
+可能就找不到。要语义检索，得配向量库或让模型来挑，那就不是零依赖了。
+
+匹配不到时会明确提示，而不是拿几份无关的凑数。
+
 ## 安装
 
 需要 Python 3.8+，无第三方依赖。
@@ -121,6 +142,26 @@ set ANTHROPIC_AUTH_TOKEN=sk-ant-...           # Windows cmd
 
 也支持 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL`。
 没有设置时，会尝试读取 `~/.claude/settings.json` 里的 `env` 块。
+
+### 用 OpenAI 兼容接口
+
+默认请求 Anthropic Messages API（`/v1/messages`）。DeepSeek、硅基流动、
+本地 Ollama 等 OpenAI 兼容端点，加 `--api-format openai`：
+
+```bash
+python session_digest.py --llm 3 \
+  --api-format openai \
+  --base-url https://api.deepseek.com/v1 \
+  --api-key sk-... \
+  --model deepseek-chat
+```
+
+- OpenAI 兼容模式**必须**指定 `--model`（或环境变量 `OPENAI_MODEL`）
+- 地址已经带 `/v1` 就原样使用，不会重复拼接
+- 环境变量可用 `OPENAI_API_KEY` / `OPENAI_MODEL`
+
+两种格式的报文不通用。配错时程序会报 HTTP 错误并提示检查 `--api-format`，
+而不是悄悄返回空摘要。
 
 ## 快速开始
 
@@ -141,6 +182,9 @@ python session_digest.py --nightly \
 
 # 5. 把最近 5 份摘要拼起来，直接粘贴给 AI
 python session_digest.py --context 5 --project shop
+
+# 6. 或者按问题找相关历史
+python session_digest.py --find "库存 架构" --top 3
 ```
 
 `--nightly` 至少需要 `--obsidian-dir` 或 `--memory-dir` 之一。
@@ -155,11 +199,14 @@ python session_digest.py --context 5 --project shop
 | `--obsidian-dir` | 无 | Obsidian 摘要根目录，给了才写 |
 | `--memory-dir` | 无 | 写入 `sessions/YYYY-MM.md` 并维护 `MEMORY.md` |
 | `--state-file` | `~/.claude-session-digest/state.json` | 偏移量与去重状态 |
-| `--index-file` | 与 state 同目录 | 会话索引，供 `--context` 使用 |
+| `--index-file` | 与 state 同目录 | 会话索引，供 `--context` / `--find` 使用 |
 | `--failures-file` | 与 state 同目录 | 失败队列 |
+| `--lock-file` | state 文件 + `.lock` | 进程锁，防止两个实例同时写 |
 | `--projects-file` | 无 | 项目名映射，见下 |
-| `--project` | 无 | `--context` 时按项目名过滤 |
+| `--project` | 无 | `--context` / `--find` 时按项目名过滤 |
+| `--top` | 3 | `--find` 返回几条 |
 | `--base-url` / `--api-key` / `--model` | 环境变量 | 模型配置 |
+| `--api-format` | `anthropic` | `anthropic`（/v1/messages）或 `openai`（/chat/completions） |
 | `--min-turns` | 8 | 新会话少于 N 条消息时跳过 |
 | `--min-age-hours` | 6 | 刚结束的会话先不动 |
 | `--max-sessions` | 20 | 单次上限，控制花费 |
@@ -199,6 +246,15 @@ python session_digest.py --retry-failed             # 逐个重试
 ```
 
 同一项连续失败 3 次后不再自动重试，避免死循环。
+
+## 并发与锁
+
+`--nightly`、`--export` 和 `--retry-failed` 启动时会先拿一个进程锁（默认是
+state 文件旁的 `state.json.lock`）。定时任务和手动运行撞上时，第二个进程会
+直接退出并提示，不会两个进程同时改 state、索引和摘要文件。
+
+锁用的是操作系统文件锁：进程正常退出或崩溃，系统都会自动释放，不会留下
+需要手工删除的死锁。`--dry-run` 只读不加锁。
 
 ## 定时任务
 
@@ -263,8 +319,10 @@ v0.1 的 state 只有 session id。v0.2 第一次运行会给旧条目补上偏�
 python -m unittest discover -s tests -v
 ```
 
-20 个用例覆盖两个解析器、增量读取、前缀哈希、事实校验（含 `--no-verify`）、
-月度块替换、规划判定、索引、失败队列和 `--context` 过滤。
+35 个用例，覆盖两个解析器、增量读取、前缀哈希、事实校验（含 `--no-verify`）、
+月度块替换、规划判定、索引、失败队列、`--context`/`--find` 过滤，
+以及进程锁（含跨进程争抢）、原子写入中断、HTTP 错误、超时、非 JSON 响应、
+模型返回被截断等异常恢复场景。接口测试用本地起的小 HTTP 服务，不访问外网。
 
 ## 常见问题
 
@@ -283,6 +341,13 @@ python -m unittest discover -s tests -v
 **和 claude-mem / claude-code-log 这些有什么区别？**
 见上文「和同类工具比」。简单说：它们多数靠 Hook 自动跑并注入上下文，
 本项目零配置、手动控制、带增量续写和事实校验，定位不同，可以同时用。
+
+**支持 OpenAI 兼容接口吗？**
+支持。加 `--api-format openai`，并显式给 `--model`。见上文「用 OpenAI 兼容接口」。
+
+**`--find` 和 `--context` 有什么区别？**
+`--context N` 取最近 N 份，适合“接上刚才的活”；`--find 关键词` 按相关度找，
+适合“以前那件事是怎么处理的”。后者是关键词匹配，不是语义检索。
 
 **支持别的 agent 吗？**
 解析器在 `parse_claude` / `parse_codex` 里，加一个 `parse_xxx` 并接进 `parse_session` 即可。欢迎 PR，附一段样本格式。

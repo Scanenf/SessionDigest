@@ -5,9 +5,12 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import session_digest as sd  # noqa: E402
@@ -23,6 +26,7 @@ def make_cfg(tmp):
         state_file=os.path.join(tmp, "state.json"),
         index_file=os.path.join(tmp, "index.json"),
         failures_file=os.path.join(tmp, "failures.json"),
+        lock_file=os.path.join(tmp, "digest.lock"),
         projects={},
         base_url="http://127.0.0.1:1",
         api_key="test",
@@ -307,6 +311,236 @@ class TestContext(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("body shop", out)
             self.assertNotIn("body pet", out)
+
+
+class _FakeAPI(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        self.server.requests.append({
+            "path": self.path,
+            "headers": dict(self.headers),
+            "body": json.loads(raw.decode("utf-8")) if raw else {},
+        })
+        if not self.server.responses:
+            status, body = 500, b"no response queued"
+        else:
+            status, body = self.server.responses.pop(0)
+        data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def fake_api(responses):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAPI)
+    srv.responses = list(responses)
+    srv.requests = []
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+ANTHROPIC_OK = {
+    "content": [{"type": "text", "text": "摘要正文"}],
+    "usage": {"input_tokens": 10, "output_tokens": 5},
+    "stop_reason": "end_turn",
+}
+OPENAI_OK = {
+    "choices": [{"message": {"content": "摘要正文"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+}
+
+
+class TestLock(unittest.TestCase):
+    def test_second_process_cannot_acquire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "digest.lock")
+            first, second = sd.ProcessLock(path), sd.ProcessLock(path)
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+            first.release()
+            self.assertTrue(second.acquire())
+            second.release()
+
+    def test_nightly_refuses_when_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            os.makedirs(cfg.obsidian_dir, exist_ok=True)
+            hold = sd.ProcessLock(cfg.lock_file)
+            self.assertTrue(hold.acquire())
+            try:
+                buf = StringIO()
+                with redirect_stdout(buf), redirect_stderr(buf):
+                    rc = sd.cmd_nightly(cfg, dry=False)
+            finally:
+                hold.release()
+            self.assertEqual(rc, 1)
+            self.assertIn("另一个 SessionDigest 进程正在运行", buf.getvalue())
+
+
+class TestAtomicWrite(unittest.TestCase):
+    def test_original_file_survives_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"old": true}')
+            with mock.patch.object(sd.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    sd.write_text_atomic(path, '{"new": true}')
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"old": true}')
+
+
+class TestLLM(unittest.TestCase):
+    def _cfg(self, tmp, fmt="anthropic"):
+        cfg = make_cfg(tmp)
+        cfg.api_format = fmt
+        cfg.model = "test-model"
+        return cfg
+
+    def test_anthropic_success(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_api([(200, ANTHROPIC_OK)]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            text, usage = sd.call_llm(cfg, "写摘要")
+            self.assertEqual(text, "摘要正文")
+            self.assertEqual(usage["output_tokens"], 5)
+            self.assertEqual(srv.requests[0]["path"], "/v1/messages")
+
+    def test_openai_success_and_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_api([(200, OPENAI_OK)]) as srv:
+            cfg = self._cfg(tmp, "openai")
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            text, usage = sd.call_llm(cfg, "写摘要")
+            self.assertEqual(text, "摘要正文")
+            self.assertEqual(usage["input_tokens"], 8)
+            self.assertEqual(srv.requests[0]["path"], "/v1/chat/completions")
+
+    def test_openai_base_with_v1_is_not_doubled(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_api([(200, OPENAI_OK)]) as srv:
+            cfg = self._cfg(tmp, "openai")
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}/v1"
+            sd.call_llm(cfg, "写摘要")
+            self.assertEqual(srv.requests[0]["path"], "/v1/chat/completions")
+
+    def test_http_error_is_reported_without_retry(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(400, {"error": "bad model"})]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            with self.assertRaises(RuntimeError) as cm:
+                sd.call_llm(cfg, "写摘要")
+            self.assertIn("HTTP 400", str(cm.exception))
+            self.assertIn("--api-format", str(cm.exception))
+            self.assertEqual(len(srv.requests), 1)
+
+    def test_server_error_retried_once(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(500, b"oops"), (200, ANTHROPIC_OK)]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            with mock.patch.object(sd.time, "sleep", return_value=None):
+                text, _ = sd.call_llm(cfg, "写摘要")
+            self.assertEqual(text, "摘要正文")
+            self.assertEqual(len(srv.requests), 2)
+
+    def test_non_json_response_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(200, b"<html>oops</html>")]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            with self.assertRaises(RuntimeError) as cm:
+                sd.call_llm(cfg, "写摘要")
+            self.assertIn("不是 JSON", str(cm.exception))
+
+    def test_network_timeout_becomes_runtime_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            cfg.base_url = "http://127.0.0.1:1"
+            with mock.patch.object(sd.urllib.request, "urlopen",
+                                   side_effect=TimeoutError("slow")):
+                with mock.patch.object(sd.time, "sleep", return_value=None):
+                    with self.assertRaises(RuntimeError) as cm:
+                        sd.call_llm(cfg, "写摘要")
+            self.assertIn("请求失败", str(cm.exception))
+
+    def test_truncated_answer_is_retried_with_larger_budget(self):
+        empty = {"content": [], "usage": {}, "stop_reason": "max_tokens"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                fake_api([(200, empty), (200, ANTHROPIC_OK)]) as srv:
+            cfg = self._cfg(tmp)
+            cfg.base_url = f"http://127.0.0.1:{srv.server_port}"
+            text, _ = sd.call_llm(cfg, "写摘要", max_tokens=100)
+            self.assertEqual(text, "摘要正文")
+            self.assertEqual(srv.requests[0]["body"]["max_tokens"], 100)
+            self.assertEqual(srv.requests[1]["body"]["max_tokens"], 200)
+
+
+class TestFind(unittest.TestCase):
+    def _seed(self, cfg):
+        os.makedirs(cfg.obsidian_dir, exist_ok=True)
+        idx = sd.load_index(cfg)
+        docs = [
+            ("a", "shop", "2026-11-01", "导出中文名乱码", "库存系统 架构 改成导出服务"),
+            ("b", "pet", "2026-11-02", "桌宠气泡", "猫 桌面 气泡 动画 库存 无关"),
+        ]
+        for sid, project, date, title, body in docs:
+            p = os.path.join(cfg.obsidian_dir, date[:7], f"{date}_{sid}.md")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f'---\ntitle: "{title}"\ndate: {date}\nproject: {project}\n'
+                        f'session: "{sid}"\n---\n\n# {title}\n\n{body}\n')
+            idx["sessions"][sid] = {"date": date, "project": project, "title": title,
+                                    "sid": sid, "file": p}
+        sd.save_index(cfg, idx)
+        return idx
+
+    def test_find_ranks_matching_summary_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            self._seed(cfg)
+            results = sd.search_summaries(cfg, "库存 架构", 3, None)
+            self.assertEqual(results[0]["rec"]["sid"], "a")
+            self.assertGreater(results[0]["score"], results[1]["score"])
+
+    def test_find_respects_project_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            self._seed(cfg)
+            results = sd.search_summaries(cfg, "库存", 3, "pet")
+            self.assertEqual([r["rec"]["sid"] for r in results], ["b"])
+
+    def test_find_prints_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            self._seed(cfg)
+            buf = StringIO()
+            with redirect_stdout(buf):
+                rc = sd.cmd_find(cfg, "架构", 3, None)
+            self.assertEqual(rc, 0)
+            self.assertIn("改成导出服务", buf.getvalue())
+            self.assertNotIn("动画 库存 无关", buf.getvalue())
+
+    def test_find_without_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            self._seed(cfg)
+            buf = StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                rc = sd.cmd_find(cfg, "量子计算", 3, None)
+            self.assertEqual(rc, 1)
+            self.assertIn("不是语义检索", buf.getvalue())
 
 
 if __name__ == "__main__":
