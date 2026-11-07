@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import unicodedata
@@ -884,7 +885,8 @@ def walk_blocks(content: object) -> Iterator[Tuple[str, object]]:
 
 def _blank_info(kind: str) -> dict:
     return {"kind": kind, "prompts": [], "assistant": [], "tools": Counter(),
-            "files": OrderedDict(), "commands": [], "tool_results": [], "modified": [],
+            "files": OrderedDict(), "commands": [], "command_events": [],
+            "tool_results": [], "modified": [],
             "turns": 0, "cwd": None, "branch": None,
             "start": None, "end": None, "session": None, "error": None}
 
@@ -897,6 +899,58 @@ def _fmt_ts(ts) -> Optional[str]:
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return str(ts)[:16].replace("T", " ")
+
+
+_SUCCESS_PATTERNS = [
+    r"\bexit\s+code\s*[:=]?\s*0\b",
+    r"\bexit_code\s*[:=]?\s*0\b",
+    r"\bprocess\s+exited\s+with\s+(?:code\s+)?0\b",
+    r'"success"\s*:\s*true',
+    r"\ball\s+tests?\s+passed\b",
+    r"\b\d+\s+passed\b",
+    r"\b0\s+failed\b",
+    r"\bexit\s+status\s*[:=]?\s*0\b",
+]
+
+
+def success_evidence(result: str) -> bool:
+    """只认明确的成功证据；没有证据不等于成功。"""
+    text = str(result or "")
+    if not text:
+        return False
+    low = text.lower()
+    if re.search(r"\b[1-9]\d*\s+(?:failed|failure|errors?)\b", low):
+        return False
+    if re.search(r"\bexpected\s+(?:exit\s+code|success|0\s+errors?)\b", low):
+        return False
+    return any(re.search(p, low) for p in _SUCCESS_PATTERNS)
+
+
+def _add_command_event(info: dict, cmd: str, tool_use_id: Optional[str],
+                       channel: str) -> None:
+    if not cmd or len(info["command_events"]) >= 200:
+        return
+    info["command_events"].append({
+        "cmd": trunc(cmd, 300),
+        "tool_use_id": tool_use_id or "",
+        "channel": channel,
+        "result": "",
+        "is_error": None,
+        "success_evidence": False,
+    })
+
+
+def _attach_tool_result(info: dict, tool_use_id: Optional[str],
+                        result: str, is_error=None) -> None:
+    if not tool_use_id:
+        return
+    for ev in reversed(info["command_events"]):
+        if ev.get("tool_use_id") == tool_use_id:
+            ev["result"] = trunc(result, 400)
+            ev["is_error"] = bool(is_error) if is_error is not None else None
+            ev["success_evidence"] = (
+                not ev["is_error"] and success_evidence(result))
+            return
 
 
 def _parse_claude_line(e: dict, info: dict) -> None:
@@ -931,6 +985,8 @@ def _parse_claude_line(e: dict, info: dict) -> None:
                 res = " ".join(x for x in got if x.strip())
                 if res and len(info["tool_results"]) < 40:
                     info["tool_results"].append(trunc(res, 400))
+                _attach_tool_result(info, data.get("tool_use_id"), res,
+                                    data.get("is_error"))
         joined = " ".join(p for p in text_parts if p.strip())
         if not has_tool_result:
             p = clean_prompt(joined)
@@ -952,6 +1008,8 @@ def _parse_claude_line(e: dict, info: dict) -> None:
                 cmd = inp.get("command")
                 if cmd and len(info["commands"]) < 60:
                     info["commands"].append(trunc(cmd, 300))
+                if cmd:
+                    _add_command_event(info, cmd, data.get("id"), "tool_use")
                 fp = inp.get("file_path") or inp.get("pattern")
                 if fp:
                     key = str(fp)
@@ -1004,13 +1062,31 @@ def _parse_codex_line(e: dict, info: dict) -> None:
         name = p.get("name") or pt
         info["tools"][name] += 1
         args = p.get("arguments") or p.get("input") or p.get("command") or ""
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                args = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                args = {}
         if isinstance(args, dict):
             cmd = args.get("command") or args.get("cmd")
             if cmd and len(info["commands"]) < 60:
                 info["commands"].append(trunc(cmd, 300))
+            if cmd and pt in ("function_call", "custom_tool_call"):
+                _add_command_event(info, cmd,
+                                   p.get("call_id") or p.get("id"), pt)
             fp = args.get("file_path") or args.get("pattern")
             if fp:
                 info["files"].setdefault(str(fp), None)
+    elif pt in ("function_call_output", "custom_tool_call_output",
+                "tool_result"):
+        out = p.get("output")
+        if isinstance(out, dict):
+            out = out.get("content") or out.get("text") or ""
+        elif not isinstance(out, str):
+            out = str(out or "")
+        _attach_tool_result(info, p.get("call_id") or p.get("tool_call_id"),
+                            out, p.get("is_error"))
 
 
 def parse_claude(path: str) -> dict:
@@ -1099,6 +1175,22 @@ def session_key(info: dict, path: str) -> str:
 # 事实校验
 # ---------------------------------------------------------------------------
 
+_LEGEND = ("> 校验图例：⚠ = 原文中未找到或未执行；"
+           "⚠≠ = 原文有相近但不同的条目；"
+           "⚠? = 原文未证实执行结果。\n\n")
+
+_LEVEL_ORDER = {"missing": 0, "mentioned": 1, "executed": 2, "succeeded": 3,
+                "result_verified": 4}
+
+_SHELL_WRAPPERS = {"bash", "sh", "zsh", "fish", "cmd", "cmd.exe",
+                   "powershell", "powershell.exe", "pwsh", "pwsh.exe"}
+_INTERPRETERS = {"python", "python3", "py", "python.exe", "python3.exe"}
+_RUNNER_PROGRAMS = {"git", "pip", "pip3", "cargo", "go", "dotnet", "make",
+                    "docker", "kubectl", "poetry"}
+_PACKAGE_MANAGERS = {"npm", "yarn", "pnpm", "bun"}
+_RESULT_RE = re.compile(r"通过|成功|修复|解决|正常|生效|已完成")
+
+
 def _norm_match(s: str) -> str:
     s = str(s).replace("`", "").strip().lower()
     s = s.replace("\\", "/")
@@ -1106,55 +1198,303 @@ def _norm_match(s: str) -> str:
 
 
 def _source_text(info: dict) -> str:
+    """校验只认原文事实：prompt、工具输出、文件、命令，不认助手正文。"""
     parts = []
     parts += info.get("prompts", [])
-    parts += info.get("assistant", [])
     parts += info.get("commands", [])
     parts += info.get("tool_results", [])
     parts += list(info.get("files", {}).keys())
     parts += info.get("modified", [])
+    parts += [str(e.get("result") or "") for e in _events(info)]
     return _norm_match("\n".join(str(p) for p in parts))
 
 
-def verify_summary(text: str, info: dict, extra_source: str = "") -> str:
-    """把摘要里反引号包裹的标识符与原文比对，未命中的标 ⚠。"""
-    source = _source_text(info)
-    if extra_source:
-        source += "\n" + _norm_match(extra_source)
-    if not source:
+def _strip_quotes(tok: str) -> str:
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+        return tok[1:-1]
+    return tok
+
+
+def _norm_argv_token(tok: str, index: int) -> str:
+    t = str(tok)
+    pathlike = index == 0 or "/" in t or "\\" in t \
+        or bool(re.match(r"^[A-Za-z]:", t))
+    if not pathlike:
+        return t
+    t = t.replace("\\", "/")
+    while t.startswith("./"):
+        t = t[2:]
+    if re.match(r"^[A-Za-z]:/", t):
+        t = t[0].lower() + t[1:]
+    if index == 0:
+        t = t.lower()
+    return t
+
+
+def canonical_argv(cmd, _depth: int = 0) -> List[str]:
+    """把命令拆成可严格比较的 argv；只做无歧义的规范化。"""
+    s = str(cmd or "").strip()
+    if not s:
+        return []
+    try:
+        toks = shlex.split(s, posix=False)
+    except ValueError:
+        toks = s.split()
+    toks = [_strip_quotes(t) for t in toks]
+    if len(toks) >= 3 and os.path.basename(toks[0]).lower() in _SHELL_WRAPPERS:
+        flag = toks[1].lower()
+        if flag in ("-c", "/c", "-command", "-commandwithargs", "--command"):
+            inner = " ".join(toks[2:])
+            if _depth < 2:
+                return canonical_argv(inner, _depth + 1)
+    if toks and os.path.basename(toks[0]).lower() in _INTERPRETERS \
+            and len(toks) >= 3 and toks[1] == "-m":
+        toks = toks[2:]
+    return [_norm_argv_token(t, i) for i, t in enumerate(toks)]
+
+
+def _subcommand(pos: List[str]) -> Optional[str]:
+    """识别常见工具的 subcommand，用于区分 build 和 build:prod。"""
+    if not pos:
+        return None
+    prog = pos[0]
+    if prog in _PACKAGE_MANAGERS:
+        if len(pos) >= 3 and pos[1] in ("run", "exec", "script"):
+            return pos[2]
+        return pos[1] if len(pos) >= 2 else None
+    if prog in _RUNNER_PROGRAMS:
+        return pos[1] if len(pos) >= 2 else None
+    return None
+
+
+def compare_argv(candidate: str, source: str) -> Tuple[str, str]:
+    """严格比较两条命令；ok 只代表 argv 完全一致。"""
+    cand_text = str(candidate or "")
+    if "..." in cand_text or "…" in cand_text:
+        return "conflict", "abbreviated"
+    c = canonical_argv(cand_text)
+    s = canonical_argv(source)
+    if not c or not s:
+        return "not_found", ""
+    if c[0] != s[0]:
+        return "not_found", "program-differs"
+    c_rest, s_rest = c[1:], s[1:]
+    c_flags = Counter(t for t in c_rest if t.startswith("-"))
+    s_flags = Counter(t for t in s_rest if t.startswith("-"))
+    c_pos = [t for t in c_rest if not t.startswith("-")]
+    s_pos = [t for t in s_rest if not t.startswith("-")]
+    c_sub = _subcommand([t for t in c if not t.startswith("-")])
+    s_sub = _subcommand([t for t in s if not t.startswith("-")])
+    if c_sub is not None and s_sub is not None and c_sub != s_sub:
+        return "conflict", "subcommand-conflict"
+    if len(c_pos) < len(s_pos):
+        return "conflict", "omitted-args"
+    if len(c_pos) > len(s_pos):
+        return "conflict", "extra-args"
+    for a, b in zip(c_pos, s_pos):
+        if a != b:
+            return "conflict", "value-conflict"
+    if c_flags != s_flags:
+        return "conflict", "flags-differ"
+    return "ok", ""
+
+
+def _events(info: dict) -> List[dict]:
+    evs = info.get("command_events")
+    if isinstance(evs, list) and evs:
+        return [e for e in evs if isinstance(e, dict)]
+    # 兼容手工构造的 info：只有 commands 时视为 executed，但没有成功证据
+    return [{"cmd": str(c), "channel": "tool_use", "tool_use_id": "",
+             "result": "", "is_error": None, "success_evidence": False}
+            for c in info.get("commands", [])]
+
+
+def _event_level(ev: dict) -> str:
+    if ev.get("success_evidence") and not ev.get("is_error"):
+        return "succeeded"
+    return "executed"
+
+
+def _mentioned_text(info: dict) -> str:
+    parts = list(info.get("prompts", []))
+    parts += list(info.get("tool_results", []))
+    parts += list(info.get("commands", []))
+    parts += [str(e.get("result") or "") for e in _events(info)]
+    return _norm_match("\n".join(str(p) for p in parts))
+
+
+def _argv_overlap(a: str, b: str) -> float:
+    ca = Counter(canonical_argv(a))
+    cb = Counter(canonical_argv(b))
+    total = sum(ca.values()) + sum(cb.values())
+    if not total:
+        return 0.0
+    return sum((ca & cb).values()) / total
+
+
+def match_command(candidate: str, info: dict):
+    """返回 (status, reason, event, level)。
+
+    status: ok | conflict | not_executed | not_found。
+    多条来源取最优：ok > conflict（token 重合度最高）> not_found > not_executed。
+    """
+    best = None
+    for ev in _events(info):
+        status, reason = compare_argv(candidate, ev.get("cmd", ""))
+        if status == "ok":
+            return "ok", "", ev, _event_level(ev)
+        if status == "conflict":
+            score = _argv_overlap(candidate, ev.get("cmd", ""))
+            # 参数不同的命令不算成功，即使同程序的另一条命令成功了
+            if best is None or score > best[0]:
+                best = (score, reason, ev)
+    if best is not None:
+        return "conflict", best[1], best[2], "executed"
+    needle = _norm_match(candidate)
+    if needle and needle in _mentioned_text(info):
+        return "not_executed", "", None, "mentioned"
+    return "not_found", "", None, "missing"
+
+
+def _near_identifier(needle: str, source: str) -> bool:
+    if not needle:
+        return False
+    base = os.path.basename(needle.replace("\\", "/")).lower()
+    if len(base) >= 4 and base in source:
+        return True
+    toks = text_tokens(needle)
+    if toks:
+        hit = sum(1 for t in toks if t in source)
+        if hit / len(toks) >= 0.6:
+            return True
+    return False
+
+
+def _fragment_level(frag: str, info: dict, source: str) -> str:
+    status, _reason, _ev, level = match_command(frag, info)
+    if status == "ok":
+        return level
+    if status == "conflict":
+        return "executed"
+    needle = _norm_match(frag)
+    if needle and needle in source:
+        return "mentioned"
+    return "missing"
+
+
+def _sentence_parts(line: str) -> List[str]:
+    return re.findall(r"[^。！？；!?;]+[。！？；!?;]?", line)
+
+
+def check_outcome_claims(text: str, info: dict) -> str:
+    """结果性表述缺少执行证据时加 ⚠?；只处理与标识符同句的动词。"""
+    if not _RESULT_RE.search(text):
         return text
+    source = _source_text(info)
+    out = []
+    for line in text.splitlines():
+        if line.strip().startswith("#") or "⚠?" in line:
+            out.append(line)
+            continue
+        pieces = []
+        for seg in _sentence_parts(line):
+            if not _RESULT_RE.search(seg) or "`" not in seg:
+                pieces.append(seg)
+                continue
+            frags = re.findall(r"`([^`]+)`", seg)
+            levels = [_fragment_level(f, info, source) for f in frags]
+            best = max(levels, key=lambda x: _LEVEL_ORDER.get(x, 0))
+            if _LEVEL_ORDER.get(best, 0) >= _LEVEL_ORDER["succeeded"]:
+                pieces.append(seg)
+                continue
+            m = re.match(r"^(.*?)([。！？；!?;]+)$", seg)
+            if m:
+                pieces.append(m.group(1).rstrip() + " ⚠?" + m.group(2))
+            else:
+                pieces.append(seg.rstrip() + " ⚠?")
+        out.append("".join(pieces))
+    return "\n".join(out)
+
+
+def _mark_fragments(body: str, info: dict, source: str,
+                    category: str) -> str:
+    def repl(m):
+        frag = m.group(1)
+        if len(frag.strip()) < 4:
+            return m.group(0)
+        tail = body[m.end():].lstrip()
+        if tail.startswith("⚠"):
+            return m.group(0)
+        if category == "命令":
+            status, _reason, _ev, _level = match_command(frag, info)
+            if status == "ok":
+                return m.group(0)
+            return f"`{frag}` " + ("⚠≠" if status == "conflict" else "⚠")
+        needle = _norm_match(frag)
+        if needle and (needle in source
+                       or (len(needle) > 60 and needle[:60] in source)):
+            return m.group(0)
+        if _near_identifier(needle, source):
+            return f"`{frag}` ⚠≠"
+        return f"`{frag}` ⚠"
+
+    return re.sub(r"`([^`]+)`", repl, body)
+
+
+def verify_summary(text: str, info: dict) -> str:
+    """把摘要里反引号包裹的标识符与原文比对，按证据等级加标记。"""
+    source = _source_text(info)
 
     out = []
     in_identifiers = False
     for line in text.splitlines():
         h = line.strip()
-        if h.startswith("##"):
-            in_identifiers = h.endswith("关键标识符")
-        if in_identifiers and re.match(r"^-\s*[^：:]+[：:]", line):
-            line = _mark_unverified(line, source)
+        if h.startswith("#"):
+            in_identifiers = "关键标识符" in h
+        if in_identifiers:
+            m = re.match(r"^(\s*-\s*)([^：:]+?)(\s*[：:])(.*)$", line)
+            if m:
+                line = (m.group(1) + m.group(2) + m.group(3)
+                        + _mark_fragments(m.group(4), info, source,
+                                          m.group(2).strip()))
         out.append(line)
-    return "\n".join(out)
+    result = check_outcome_claims("\n".join(out), info)
+    if "⚠" in result and "校验图例" not in result:
+        result = _LEGEND + result
+    return result
 
 
-def _mark_unverified(line: str, source: str) -> str:
-    def repl(m):
-        frag = m.group(1)
-        if len(frag.strip()) < 4:
-            return m.group(0)
+def carry_forward_warnings(text: str, prev_summary: str, info: dict) -> str:
+    """旧摘要不是事实来源；它标过的条目在新文本里继续保持标记。
+
+    只有当前增量记录重新提供了依据时，才允许去掉旧标记。
+    """
+    if not prev_summary or "⚠" not in prev_summary:
+        return text
+    pairs = re.findall(r"`([^`]+)`\s*(⚠≠|⚠\?|⚠)", prev_summary)
+    if not pairs:
+        return text
+    source = _source_text(info)
+    out = text
+    for frag, mark in pairs:
         needle = _norm_match(frag)
-        if len(needle) > 60:
-            needle = needle[:60]
         if needle and needle in source:
-            return m.group(0)
-        return f"`{frag}` ⚠"
-
-    return re.sub(r"`([^`]+)`", repl, line)
+            continue
+        if match_command(frag, info)[0] == "ok":
+            continue
+        pat = re.compile(r"`" + re.escape(frag) + r"`(?!\s*⚠)")
+        out = pat.sub(lambda m: f"`{frag}` {mark}", out)
+    if "⚠" in out and "校验图例" not in out:
+        out = _LEGEND + out
+    return out
 
 
 def checked_summary(cfg: "Config", text: str, info: dict,
-                    extra_source: str = "") -> str:
-    """按配置决定是否做事实校验。"""
-    return verify_summary(text, info, extra_source) if cfg.verify else text
+                    prev_summary: str = "") -> str:
+    """按配置决定是否做事实校验；旧摘要只用于继承警告，不作为依据。"""
+    if not cfg.verify:
+        return text
+    return carry_forward_warnings(verify_summary(text, info), prev_summary, info)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,8 +1578,10 @@ def summary_prompt(info: dict, label: str, transcript: str) -> str:
 
 写作要求：
 1. 用叙事体。人称固定：第二人称「你」只指用户（会话发起者），AI 一律称「助手」；不要用「他」「她」指人。
-2. 「关键标识符」必须逐字抄录，不得改写、概括或翻译；但只收关键项，宁可少列，不要罗列。每一项没有就写「无」。
-3. 不要编造原文没有的事实。
+2. 「关键标识符」必须逐字抄录，不得改写、概括或翻译；不要加省略号，不要补全参数。但只收关键项，宁可少列，不要罗列。每一项没有就写「无」。
+3. 只写会话记录里明确出现的事实。助手自己的推测、承诺、计划或「应该没问题」不算事实，不能当成已发生的结果。
+4. 命令只有记录里确实调用执行过才能写进「命令」；只在讨论里提到的，要写「提到」而不是「执行」。没有明确成功输出（如 exit code 0、Process exited with code 0、All tests passed）时，不得写「通过」「成功」「修复完成」。
+5. 不要自己添加 ⚠、⚠≠、⚠? 等标记，程序会统一校验和标注。
 
 严格按以下结构输出：
 
@@ -1292,7 +1634,9 @@ def continuation_prompt(prev_summary: str, info: dict, delta: str, date: str) ->
 ### 还没完的事
 （1-3 条；没有就写「无」）
 
-要求：不要重复旧摘要里已有的内容；不要编造原文没有的事实；标识符逐字抄录。
+要求：不要重复旧摘要里已有的内容；只写新增记录里明确出现的事实，助手的推测不算事实；
+标识符逐字抄录，不要加省略号；命令只有确实执行过才能写成「执行」，没有明确成功输出不得写「通过」「成功」；
+不要自己添加 ⚠、⚠≠、⚠? 标记。
 """
 
 
@@ -1318,6 +1662,9 @@ def merge_prompt(prev_summary: str) -> str:
 
 ## 还没完的事
 （1-3 条）
+
+要求：标识符逐字保留，不要加省略号或补全参数；不要编造待合并内容里没有的事实；
+不要自己添加 ⚠、⚠≠、⚠? 标记，已有的标记保持原样。
 
 以下是待合并内容：
 

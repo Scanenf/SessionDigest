@@ -130,6 +130,9 @@ class TestVerify(unittest.TestCase):
     def test_marks_missing_identifiers(self):
         info = sd._blank_info("claude")
         info["prompts"] = ["改 /a/b.py，执行 pytest -q"]
+        info["command_events"] = [{
+            "cmd": "pytest -q", "tool_use_id": "t1", "channel": "tool_use",
+            "result": "", "is_error": None, "success_evidence": False}]
         text = ("## 关键标识符\n"
                 "- 路径：`/a/b.py`\n"
                 "- 路径：`/missing/file.py`\n"
@@ -1481,6 +1484,279 @@ class TestRepoHygiene(unittest.TestCase):
         self.assertIn("风险降低措施，不是安全边界", readme)
         for bad in ("零泄漏", "绝对安全", "保证不含敏感信息"):
             self.assertNotIn(bad, readme)
+
+
+class TestVerifyMatching(unittest.TestCase):
+    """命令比对只认规范化后 argv 完全相同；参数不同必须 ⚠≠。"""
+
+    def _status(self, candidate, source):
+        return sd.compare_argv(candidate, source)[0]
+
+    def _reason(self, candidate, source):
+        return sd.compare_argv(candidate, source)[1]
+
+    def test_ok_cases(self):
+        cases = [
+            ("pytest tests/test_export.py -q",
+             "python -m pytest tests/test_export.py -q"),
+            ("pytest -q tests/test_export.py",
+             "pytest tests/test_export.py -q"),
+            ('pytest "tests/a b.py"', "pytest 'tests/a b.py'"),
+            ("python C:\\work\\a.py --x", "python C:/work/a.py --x"),
+            ('bash -c "pytest -q"', "pytest -q"),
+        ]
+        for candidate, source in cases:
+            with self.subTest(candidate=candidate, source=source):
+                self.assertEqual(self._status(candidate, source), "ok")
+
+    def test_conflict_cases(self):
+        cases = [
+            ("pytest", "pytest tests/test_export.py -q", "omitted-args"),
+            ("pytest tests/test_export.py",
+             "pytest tests/test_export.py -q", "flags-differ"),
+            ("pytest tests -v", "pytest tests -q", "flags-differ"),
+            ("git push origin main", "git push origin feature",
+             "value-conflict"),
+            ("git push", "git push origin main", "omitted-args"),
+            ("npm run build", "npm run build:prod", "subcommand-conflict"),
+            ("pip install requests", "pip install requests==2.31",
+             "value-conflict"),
+            ("pytest --port 8080", "pytest --port 8081", "value-conflict"),
+            ("pytest -v -v", "pytest -v", "flags-differ"),
+            ("pytest tests/...", "pytest tests/test_export.py -q",
+             "abbreviated"),
+        ]
+        for candidate, source, reason in cases:
+            with self.subTest(candidate=candidate, source=source):
+                self.assertEqual(self._status(candidate, source), "conflict")
+                self.assertEqual(self._reason(candidate, source), reason)
+
+    def test_program_differs_is_not_found(self):
+        self.assertEqual(self._status("rm -rf build", "pytest tests -q"),
+                         "not_found")
+        self.assertEqual(self._status("make deploy", "npm run build"),
+                         "not_found")
+
+    def test_ok_wins_over_earlier_conflict(self):
+        info = sd._blank_info("claude")
+        info["command_events"] = [
+            {"cmd": "pytest tests -q", "tool_use_id": "t1",
+             "channel": "tool_use", "result": "", "is_error": None,
+             "success_evidence": False},
+            {"cmd": "pytest tests", "tool_use_id": "t2",
+             "channel": "tool_use", "result": "", "is_error": None,
+             "success_evidence": False},
+        ]
+        status, reason = sd.match_command("pytest tests", info)[:2]
+        self.assertEqual(status, "ok")
+        self.assertEqual(reason, "")
+
+    def test_prompt_only_command_is_not_executed(self):
+        info = sd._blank_info("claude")
+        info["prompts"] = ["先跑 pytest tests -q 看看"]
+        status, _reason, _ev, level = sd.match_command("pytest tests -q", info)
+        self.assertEqual(status, "not_executed")
+        self.assertEqual(level, "mentioned")
+
+
+class TestVerifyEvidenceLevels(unittest.TestCase):
+    def _info(self, result="", is_error=None, success=None):
+        info = sd._blank_info("claude")
+        info["command_events"] = [{
+            "cmd": "pytest tests -q", "tool_use_id": "t1",
+            "channel": "tool_use", "result": result,
+            "is_error": is_error,
+            "success_evidence": (sd.success_evidence(result)
+                                 if success is None else success)}]
+        return info
+
+    def test_mentioned_vs_executed_vs_succeeded(self):
+        info = sd._blank_info("claude")
+        info["prompts"] = ["pytest tests -q"]
+        self.assertEqual(sd.match_command("pytest tests -q", info)[3],
+                         "mentioned")
+
+        info = self._info()
+        self.assertEqual(sd.match_command("pytest tests -q", info)[3],
+                         "executed")
+
+        info = self._info("All tests passed")
+        self.assertEqual(sd.match_command("pytest tests -q", info)[3],
+                         "succeeded")
+
+    def test_generic_output_is_not_success_evidence(self):
+        for text in ("", "done", "已修复", "看起来没问题"):
+            with self.subTest(text=text):
+                self.assertFalse(sd.success_evidence(text))
+
+    def test_explicit_success_signals(self):
+        for text in ("exit code 0", "Process exited with code 0",
+                     '"success": true', "All tests passed", "3 passed"):
+            with self.subTest(text=text):
+                self.assertTrue(sd.success_evidence(text))
+
+    def test_mixed_pass_and_fail_is_not_success(self):
+        self.assertFalse(sd.success_evidence("3 passed, 1 failed"))
+
+    def test_error_flag_beats_success_text(self):
+        info = self._info("All tests passed", is_error=True)
+        self.assertEqual(sd.match_command("pytest tests -q", info)[3],
+                         "executed")
+
+    def test_result_verified_is_never_assigned(self):
+        info = self._info("All tests passed")
+        levels = {sd.match_command("pytest tests -q", info)[3] for _ in range(5)}
+        self.assertNotIn("result_verified", levels)
+
+
+class TestVerifyRegressionH1H2(unittest.TestCase):
+    """H1：助手正文不算事实；H2：续写不能把旧摘要当原文。"""
+
+    def test_assistant_text_is_not_a_source(self):
+        info = sd._blank_info("claude")
+        info["assistant"] = ["我看过了 /a/b.py，测试通过"]
+        text = "## 关键标识符\n- 路径：`/a/b.py`\n"
+        out = sd.verify_summary(text, info)
+        self.assertIn("`/a/b.py` ⚠", out)
+
+    def test_assistant_command_is_not_executed(self):
+        info = sd._blank_info("claude")
+        info["assistant"] = ["可以运行 pytest tests -q"]
+        status, _reason, _ev, _level = sd.match_command("pytest tests -q",
+                                                        info)
+        self.assertEqual(status, "not_found")
+
+    def test_prompt_text_is_source_for_paths(self):
+        info = sd._blank_info("claude")
+        info["prompts"] = ["改 /a/b.py"]
+        text = "## 关键标识符\n- 路径：`/a/b.py`\n"
+        self.assertNotIn("⚠", sd.verify_summary(text, info))
+
+    def test_previous_summary_is_not_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            info = sd._blank_info("claude")
+            info["prompts"] = ["继续改别的东西"]
+            prev = "## 关键标识符\n- 路径：`/old/verified.py`\n"
+            text = "### 关键标识符\n- 路径：`/old/verified.py`\n"
+            out = sd.checked_summary(cfg, text, info, prev)
+            self.assertIn("`/old/verified.py` ⚠", out)
+
+    def test_previous_warning_is_carried_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            info = sd._blank_info("claude")
+            prev = "## 关键标识符\n- 路径：`/old/broken.py` ⚠\n"
+            text = "### 关键标识符\n- 路径：`/old/broken.py`\n"
+            out = sd.checked_summary(cfg, text, info, prev)
+            self.assertIn("`/old/broken.py` ⚠", out)
+
+    def test_carried_warning_clears_when_delta_confirms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            info = sd._blank_info("claude")
+            info["prompts"] = ["又看了 /old/broken.py"]
+            prev = "## 关键标识符\n- 路径：`/old/broken.py` ⚠\n"
+            text = "### 关键标识符\n- 路径：`/old/broken.py`\n"
+            out = sd.checked_summary(cfg, text, info, prev)
+            self.assertNotIn("⚠", out)
+
+
+class TestVerifyOutput(unittest.TestCase):
+    def _info(self, cmd="pytest tests -q", result="", is_error=None):
+        info = sd._blank_info("claude")
+        info["command_events"] = [{
+            "cmd": cmd, "tool_use_id": "t1", "channel": "tool_use",
+            "result": result, "is_error": is_error,
+            "success_evidence": sd.success_evidence(result)}]
+        return info
+
+    def test_legend_inserted_once(self):
+        info = self._info()
+        text = "## 关键标识符\n- 命令：`pytest`\n"
+        out = sd.verify_summary(text, info)
+        self.assertIn("校验图例", out)
+        self.assertIn("⚠≠", out)
+        self.assertEqual(out.count("校验图例"), 1)
+        self.assertEqual(sd.verify_summary(out, info).count("校验图例"), 1)
+
+    def test_conflict_uses_near_marker(self):
+        info = self._info()
+        text = "## 关键标识符\n- 命令：`pytest tests -q -v`\n"
+        out = sd.verify_summary(text, info)
+        self.assertIn("`pytest tests -q -v` ⚠≠", out)
+
+    def test_missing_command_uses_plain_marker(self):
+        info = self._info()
+        text = "## 关键标识符\n- 命令：`make deploy`\n"
+        out = sd.verify_summary(text, info)
+        self.assertIn("`make deploy` ⚠", out)
+
+    def test_outcome_claim_without_success_evidence(self):
+        info = self._info()
+        text = "## 走过的路\n跑到最后 `pytest tests -q` 测试通过。\n"
+        out = sd.verify_summary(text, info)
+        self.assertIn("⚠?", out)
+
+    def test_outcome_claim_with_success_evidence_is_clean(self):
+        info = self._info(result="All tests passed")
+        text = "## 走过的路\n跑到最后 `pytest tests -q` 测试通过。\n"
+        out = sd.verify_summary(text, info)
+        self.assertNotIn("⚠?", out)
+
+    def test_no_verify_skips_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            cfg.verify = False
+            info = self._info()
+            text = "## 关键标识符\n- 命令：`make deploy`\n"
+            self.assertEqual(sd.checked_summary(cfg, text, info), text)
+
+    def test_markers_have_no_duplicates(self):
+        info = self._info()
+        text = "## 关键标识符\n- 命令：`make deploy`\n"
+        once = sd.verify_summary(text, info)
+        twice = sd.verify_summary(once, info)
+        self.assertEqual(once, twice)
+
+
+class TestCommandEventsParsing(unittest.TestCase):
+    def test_claude_tool_use_and_result_correlate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "a.jsonl")
+            write_jsonl(p, [
+                {"type": "user", "sessionId": "s", "message": {"role": "user",
+                 "content": [{"type": "text", "text": "跑测试"}]}},
+                {"type": "assistant", "message": {"role": "assistant",
+                 "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                              "input": {"command": "pytest tests -q"}}]}},
+                {"type": "user", "message": {"role": "user",
+                 "content": [{"type": "tool_result", "tool_use_id": "t1",
+                              "is_error": False,
+                              "content": "All tests passed"}]}},
+            ])
+            info = sd.parse_claude(p)
+            self.assertEqual(info["commands"], ["pytest tests -q"])
+            self.assertEqual(len(info["command_events"]), 1)
+            ev = info["command_events"][0]
+            self.assertEqual(ev["tool_use_id"], "t1")
+            self.assertTrue(ev["success_evidence"])
+            self.assertEqual(ev["result"], "All tests passed")
+
+    def test_codex_call_output_correlates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "c.jsonl")
+            write_jsonl(p, [
+                {"payload": {"type": "function_call", "name": "shell",
+                             "call_id": "c1",
+                             "arguments": json.dumps(
+                                 {"command": "npm run build"})}},
+                {"payload": {"type": "function_call_output", "call_id": "c1",
+                             "output": "Process exited with code 0"}},
+            ])
+            info = sd.parse_codex(p)
+            self.assertEqual(len(info["command_events"]), 1)
+            self.assertTrue(info["command_events"][0]["success_evidence"])
 
 
 if __name__ == "__main__":
