@@ -27,9 +27,9 @@
 
 ### 许可证
 
-- 从 MIT 改为 GNU General Public License v3.0 or later
-  （`GPL-3.0-or-later`）。已经按 MIT 发布的旧版本仍然有效；新版本要求
-  分发衍生作品时继续开源。版权人为 `Scanenf`。
+- 从 MIT 改为 Apache License 2.0（`Apache-2.0`）。已经按 MIT 发布的旧版本
+  仍然有效；新版本允许商用和闭源分发，但需要保留版权与许可证声明、
+  说明修改过的文件。版权人为 `Scanenf`。
 
 ### 兼容性
 
