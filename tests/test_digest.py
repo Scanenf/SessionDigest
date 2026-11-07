@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -159,7 +160,7 @@ class TestVerify(unittest.TestCase):
 class TestRedact(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(
-            sd, "_local_usernames", return_value=["邵长荣", "shaorong"])
+            sd, "_local_usernames", return_value=["测试用户", "testuser"])
         self.addCleanup(patcher.stop)
         patcher.start()
 
@@ -189,22 +190,22 @@ class TestRedact(unittest.TestCase):
 
     def test_strict_replaces_home_prefix(self):
         cases = [
-            (r"C:\Users\邵长荣\proj\a.py", r"~\proj\a.py"),
-            ("C:/Users/shaorong/proj/a.py", "~/proj/a.py"),
-            ("/home/shaorong/proj/a.py", "~/proj/a.py"),
-            ("/Users/shaorong/proj/a.py", "~/proj/a.py"),
-            ("/c/Users/邵长荣/proj/a.py", "~/proj/a.py"),
+            (r"C:\Users\测试用户\proj\a.py", r"~\proj\a.py"),
+            ("C:/Users/testuser/proj/a.py", "~/proj/a.py"),
+            ("/home/testuser/proj/a.py", "~/proj/a.py"),
+            ("/Users/testuser/proj/a.py", "~/proj/a.py"),
+            ("/c/Users/测试用户/proj/a.py", "~/proj/a.py"),
         ]
         for raw, want in cases:
             self.assertEqual(sd.redact_text(raw, "strict"), want)
 
     def test_safe_and_off_keep_paths(self):
-        path = r"C:\Users\邵长荣\proj\a.py"
+        path = r"C:\Users\测试用户\proj\a.py"
         self.assertEqual(sd.redact_text(path, "safe"), path)
         self.assertEqual(sd.redact_text(path, "off"), path)
 
     def test_strict_masks_standalone_username(self):
-        self.assertEqual(sd.redact_text("邵长荣的电脑", "strict"), "~的电脑")
+        self.assertEqual(sd.redact_text("测试用户的电脑", "strict"), "~的电脑")
 
     def test_transcript_is_redacted_before_model_call(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,7 +213,7 @@ class TestRedact(unittest.TestCase):
             info = sd._blank_info("claude")
             info["prompts"] = [
                 "key 是 sk-ant-api03-abcdefghijklmnop，路径 "
-                r"C:\Users\邵长荣\proj\a.py"]
+                r"C:\Users\测试用户\proj\a.py"]
             captured = {}
 
             def fake_call(cfg, prompt, **kwargs):
@@ -222,7 +223,7 @@ class TestRedact(unittest.TestCase):
             with mock.patch.object(sd, "call_llm", side_effect=fake_call):
                 sd.summarize_one(cfg, info, "shop")
             self.assertNotIn("sk-ant-api03", captured["prompt"])
-            self.assertNotIn("邵长荣", captured["prompt"])
+            self.assertNotIn("测试用户", captured["prompt"])
             self.assertIn(r"~\proj\a.py", captured["prompt"])
 
     def test_failure_errors_are_redacted(self):
@@ -619,6 +620,381 @@ class TestFind(unittest.TestCase):
                 rc = sd.cmd_find(cfg, "量子计算", 3, None)
             self.assertEqual(rc, 1)
             self.assertIn("不是语义检索", buf.getvalue())
+
+
+class PrivacyScan:
+    """把“可能落盘/打印的文本”集中起来，检查已知哨兵是否漏出。"""
+
+    REQUIRED = {
+        "state", "index", "failures", "obsidian", "monthly", "export_doc",
+        "export_readme", "memindex", "stdout", "stderr", "traceback", "temp",
+        "backup", "lock", "model_request", "untracked_repo", "ignored_log",
+    }
+
+    def __init__(self, sentinels):
+        self.needles = [s.encode("utf-8") for s in sentinels]
+        self.scanned = set()
+        self.leaks = []
+
+    def add_bytes(self, category, data):
+        self.scanned.add(category)
+        for needle in self.needles:
+            if needle in data:
+                self.leaks.append((category, needle.decode("utf-8", "replace")))
+
+    def add_text(self, category, text):
+        self.add_bytes(category, str(text).encode("utf-8"))
+
+    def add_file(self, category, path):
+        with open(path, "rb") as f:
+            self.add_bytes(category, f.read())
+
+    def add_tree(self, category, root):
+        self.scanned.add(category)
+        if not os.path.isdir(root):
+            return
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                try:
+                    self.add_file(category, os.path.join(dirpath, name))
+                except OSError:
+                    pass
+
+
+def _sha256(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _snapshot(root):
+    out = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            out[os.path.relpath(p, root)] = _sha256(p)
+    return out
+
+
+class TestPrivacyMetadata(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            sd, "_local_usernames", return_value=["测试用户"])
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def _prepare(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = make_cfg(tmp)
+        src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+        write_jsonl(src, claude_lines("sid-meta", 3))
+        return tmp, cfg, src
+
+    def test_index_and_failure_store_refs_not_sensitive_text(self):
+        tmp, cfg, src = self._prepare()
+        info = sd._blank_info("claude")
+        info["session"] = "sid-meta"
+        info["prompts"] = ["测试用户的会话"]
+        info["start"] = "2026-11-01 10:00"
+        sd.update_index(cfg, info, "测试用户项目", "body", "sid-meta",
+                        src, "full")
+        rec = sd.load_index(cfg)["sessions"]["sid-meta"]
+        self.assertEqual(rec["source_ref"], {"root": "claude", "rel": "proj/a.jsonl"})
+        self.assertEqual(rec["file_ref"]["root"], "obsidian")
+        self.assertNotIn("测试用户", json.dumps(rec, ensure_ascii=False))
+
+        sd.record_failure(cfg, "sid-meta", src, "boom 测试用户", "claude")
+        fail = sd.load_failures(cfg)["sid-meta"]
+        self.assertEqual(fail["path_ref"], {"root": "claude", "rel": "proj/a.jsonl"})
+        self.assertNotIn("测试用户", json.dumps(fail, ensure_ascii=False))
+
+    def test_execute_task_scrubs_state_and_index(self):
+        tmp, cfg, src = self._prepare()
+        info = sd.parse_session(src, "claude")
+        task = sd.Task(info=info, label="shop", kind="claude", path=src,
+                       key="sid-meta", mode="full", new_offset=os.path.getsize(src))
+        with mock.patch.object(sd, "call_llm",
+                               return_value=("摘要 测试用户", {})):
+            self.assertTrue(sd.execute_task(cfg, task, {}))
+        with open(cfg.state_file, encoding="utf-8") as f:
+            state_blob = f.read()
+        with open(cfg.index_file, encoding="utf-8") as f:
+            index_blob = f.read()
+        self.assertNotIn("测试用户", state_blob)
+        self.assertNotIn("测试用户", index_blob)
+        self.assertIn("source_ref", state_blob)
+        self.assertIn("source_ref", index_blob)
+
+    def test_legacy_metadata_migrates_and_is_idempotent(self):
+        tmp, cfg, src = self._prepare()
+        obs = os.path.join(cfg.obsidian_dir, "2026-11", "2026-11-01_sid-meta.md")
+        os.makedirs(os.path.dirname(obs), exist_ok=True)
+        with open(obs, "w", encoding="utf-8") as f:
+            f.write('---\nsession: "sid-meta"\n---\n\nold\n')
+        index = {"version": 1, "sessions": {"sid-meta": {
+            "date": "2026-11-01", "project": "测试用户项目",
+            "title": "测试用户标题", "sid": "sid-meta",
+            "file": obs, "source": src, "mode": "full", "updated": "x"}}}
+        state = {"sid-meta": {"offset": os.path.getsize(src),
+                              "prefix_sha1": sd.prefix_sha1(src, os.path.getsize(src)),
+                              "sections": 0, "first_title": "测试用户标题",
+                              "source": src}}
+        failures = {"sid-meta": {"attempts": 1, "path": src, "kind": "claude",
+                                 "error": "boom", "last": "x"}}
+        for path, data in ((cfg.index_file, index), (cfg.state_file, state),
+                           (cfg.failures_file, failures)):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+
+        self.assertTrue(sd.migrate_metadata(cfg))
+        for path in (cfg.index_file, cfg.state_file, cfg.failures_file):
+            with open(path, encoding="utf-8") as f:
+                self.assertNotIn("测试用户", f.read())
+        rec = sd.load_index(cfg)["sessions"]["sid-meta"]
+        migrated_state = sd.load_state(cfg)["sid-meta"]
+        self.assertEqual(sd.resolve_meta_path(cfg, rec, "file"), obs)
+        self.assertEqual(sd.resolve_meta_path(cfg, migrated_state, "source"), src)
+
+        before = _snapshot(tmp)
+        self.assertFalse(sd.migrate_metadata(cfg))
+        self.assertEqual(_snapshot(tmp), before)
+
+    def test_dry_run_does_not_migrate_or_lock(self):
+        tmp, cfg, src = self._prepare()
+        size = os.path.getsize(src)
+        state = {"sid-meta": {"offset": size,
+                              "prefix_sha1": sd.prefix_sha1(src, size),
+                              "sections": 0, "first_title": "测试用户标题",
+                              "source": src}}
+        with open(cfg.state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        before = _snapshot(tmp)
+        buf = StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            sd._run_nightly(cfg, dry=True)
+        self.assertEqual(_snapshot(tmp), before)
+        self.assertFalse(os.path.exists(cfg.lock_file))
+
+
+class TestPrivacyReadTime(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            sd, "_local_usernames", return_value=["测试用户"])
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_summary_and_commands_redact_on_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            obs = os.path.join(cfg.obsidian_dir, "2026-11", "2026-11-01_sid-r.md")
+            os.makedirs(os.path.dirname(obs), exist_ok=True)
+            with open(obs, "w", encoding="utf-8") as f:
+                f.write('---\ntitle: "测试用户标题"\nproject: 测试用户项目\n'
+                        'session: "sid-r"\n---\n\n# 测试用户标题\n\n'
+                        '路径 C:\\Users\\测试用户\\proj\\a.py\n')
+            idx = sd.load_index(cfg)
+            idx["sessions"]["sid-r"] = {
+                "date": "2026-11-01", "project": "测试用户项目",
+                "title": "测试用户标题", "sid": "sid-r", "file": obs}
+            sd.save_index(cfg, idx)
+
+            text = sd.summary_text(cfg, idx["sessions"]["sid-r"])
+            self.assertNotIn("测试用户", text)
+            self.assertIn("~", text)
+
+            for func, args in ((sd.cmd_context, (cfg, 5, None)),
+                               (sd.cmd_find, (cfg, "路径", 3, None))):
+                buf = StringIO()
+                with redirect_stdout(buf), redirect_stderr(buf):
+                    func(*args)
+                self.assertNotIn("测试用户", buf.getvalue())
+
+    def test_vault_fallback_only_indexes_digest_docs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            digest = os.path.join(cfg.obsidian_dir, "2026-11", "a.md")
+            note = os.path.join(cfg.obsidian_dir, "2026-11", "b.md")
+            os.makedirs(os.path.dirname(digest), exist_ok=True)
+            with open(digest, "w", encoding="utf-8") as f:
+                f.write('---\ntitle: "测试用户标题"\nproject: 测试用户项目\n'
+                        'session: "sid-d"\ntags: [自动摘要]\n---\n\n'
+                        '## 关键标识符\n- 路径：`a.py`\n')
+            with open(note, "w", encoding="utf-8") as f:
+                f.write('---\ntitle: 私人笔记\n---\n\n路径 a.py 测试用户\n')
+            docs = sd._docs_from_vault(cfg)
+            self.assertEqual([d["sid"] for d in docs], ["sid-d"])
+            self.assertNotIn("测试用户", json.dumps(docs, ensure_ascii=False))
+
+    def test_model_label_is_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            info = sd._blank_info("claude")
+            captured = {}
+
+            def fake_call(cfg, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return "ok", {}
+
+            with mock.patch.object(sd, "call_llm", side_effect=fake_call):
+                sd.summarize_one(cfg, info, "测试用户项目")
+            self.assertNotIn("测试用户", captured["prompt"])
+
+    def test_failure_and_traceback_are_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            cfg.verbose = True
+            src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+            write_jsonl(src, claude_lines("sid-e", 3))
+            info = sd.parse_session(src, "claude")
+            task = sd.Task(info=info, label="shop", kind="claude", path=src,
+                           key="sid-e", mode="full", new_offset=os.path.getsize(src))
+            err = StringIO()
+            with mock.patch.object(
+                    sd, "call_llm",
+                    side_effect=RuntimeError("boom 测试用户 sk-ant-abcdefghijklmnop")):
+                with redirect_stdout(StringIO()), redirect_stderr(err):
+                    self.assertFalse(sd.execute_task(cfg, task, {}))
+            self.assertNotIn("测试用户", err.getvalue())
+            self.assertNotIn("sk-ant-", err.getvalue())
+
+    def test_print_plan_redacts_path_and_label(self):
+        info = sd._blank_info("claude")
+        info["start"] = "2026-11-01 10:00"
+        info["turns"] = 6
+        task = sd.Task(info=info, label="测试用户项目", kind="claude",
+                       path=r"C:\Users\测试用户\proj\a.jsonl", key="x", mode="full")
+        buf = StringIO()
+        with redirect_stdout(buf):
+            sd.print_plan([task])
+        self.assertNotIn("测试用户", buf.getvalue())
+
+
+class TestPrivacyScanCoverage(unittest.TestCase):
+    SENTINELS = ["邵哨兵", "sk-ant-SENTINEL1234567890",
+                 "sentinel@example.com", "192.168.77.88",
+                 r"C:\Users\邵哨兵"]
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            sd, "_local_usernames", return_value=["邵哨兵"])
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_known_sentinels_do_not_appear_in_produced_artifacts(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = make_cfg(tmp)
+        cfg.verbose = True
+        src = os.path.join(cfg.claude_root, "proj", "a.jsonl")
+        lines = claude_lines("sid-p", 3)
+        lines[0]["message"]["content"][0]["text"] = (
+            "请处理 " + " ".join(self.SENTINELS) + " " + "x" * 80)
+        write_jsonl(src, lines)
+
+        sentinel_text = " ".join(self.SENTINELS)
+        captured = []
+
+        def fake_call(cfg, prompt, **kwargs):
+            captured.append(prompt)
+            return "## 这一段在做什么\n" + sentinel_text, {
+                "input_tokens": 1, "output_tokens": 1}
+
+        state = {}
+        with mock.patch.object(sd, "call_llm", side_effect=fake_call):
+            tasks, _ = sd.plan_nightly(cfg, state)
+            self.assertEqual(len(tasks), 1)
+            self.assertTrue(sd.execute_task(cfg, tasks[0], state))
+        sd.record_failure(cfg, "sid-f", src, "boom " + sentinel_text, "claude")
+        sd._run_export(cfg)
+
+        out_buf, err_buf = StringIO(), StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            sd.cmd_find(cfg, "邵哨兵", 3, None)
+            sd.cmd_context(cfg, 5, None)
+        with redirect_stdout(StringIO()), redirect_stderr(err_buf):
+            sd.cmd_find(cfg, "不存在的词", 3, None)
+
+        fail_info = sd.parse_session(src, "claude")
+        fail_task = sd.Task(info=fail_info, label="shop", kind="claude", path=src,
+                            key="sid-boom", mode="full",
+                            new_offset=os.path.getsize(src))
+        trace_buf = StringIO()
+        with mock.patch.object(sd, "call_llm",
+                               side_effect=RuntimeError("boom " + sentinel_text)):
+            with redirect_stdout(StringIO()), redirect_stderr(trace_buf):
+                sd.execute_task(cfg, fail_task, {})
+
+        tmp_target = os.path.join(cfg.out_dir, "atomic.txt")
+        with mock.patch.object(sd.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                sd.write_text_atomic(tmp_target, sentinel_text)
+        self.assertFalse(os.path.exists(tmp_target + ".tmp"))
+
+        backup = cfg.state_file + ".bak"
+        shutil.copyfile(cfg.state_file, backup)
+        lock = sd.ProcessLock(cfg.lock_file)
+        self.assertTrue(lock.acquire())
+        lock.release()
+        lock_snapshot = os.path.join(tmp, "lock-copy")
+        shutil.copyfile(cfg.lock_file, lock_snapshot)
+
+        log_path = os.path.join(tmp, "nightly.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(out_buf.getvalue() + err_buf.getvalue())
+
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        shutil.copyfile(cfg.index_file, os.path.join(repo, "index.json"))
+        try:
+            subprocess.run(["git", "init", "-q"], cwd=repo,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True)
+            listing = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=repo, capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            # 没装 git 时退回全目录遍历，仍然扫描同一批文件
+            listing = "\n".join(
+                "?? " + os.path.relpath(os.path.join(dp, name), repo)
+                for dp, _dirs, files in os.walk(repo) for name in files)
+
+        scan = PrivacyScan(self.SENTINELS)
+        scan.add_file("state", cfg.state_file)
+        scan.add_file("index", cfg.index_file)
+        scan.add_file("failures", cfg.failures_file)
+        scan.add_file("memindex", os.path.join(cfg.memory_dir, "MEMORY.md"))
+        scan.add_file("export_readme", os.path.join(cfg.out_dir, "README.md"))
+        scan.add_tree("obsidian", cfg.obsidian_dir)
+        scan.add_tree("monthly", os.path.join(cfg.memory_dir, "sessions"))
+        scan.add_tree("export_doc", cfg.out_dir)
+        scan.add_text("stdout", out_buf.getvalue())
+        scan.add_text("stderr", err_buf.getvalue())
+        scan.add_text("traceback", trace_buf.getvalue())
+        scan.add_text("temp", "")            # 临时文件已确认不存在
+        scan.add_file("backup", backup)
+        scan.add_file("lock", lock_snapshot)
+        scan.add_text("model_request", "\n".join(captured))
+        scan.add_file("ignored_log", log_path)
+        for line in listing.splitlines():
+            rel = line[3:].strip()
+            if rel:
+                scan.add_file("untracked_repo", os.path.join(repo, rel))
+
+        self.assertEqual(PrivacyScan.REQUIRED - scan.scanned, set())
+        self.assertEqual(scan.leaks, [])
+
+
+class TestRepoHygiene(unittest.TestCase):
+    def test_license_and_readme_privacy_wording(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "LICENSE"), encoding="utf-8") as f:
+            self.assertIn("Copyright (c) 2026 Scannef", f.read())
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("风险降低措施，不是安全边界", readme)
+        for bad in ("零泄漏", "绝对安全", "保证不含敏感信息"):
+            self.assertNotIn(bad, readme)
 
 
 if __name__ == "__main__":

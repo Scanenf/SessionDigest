@@ -98,7 +98,8 @@ def load_projects(path: Optional[str]) -> Dict[str, str]:
             data = json.load(f)
         return {str(k): str(v) for k, v in data.items() if k}
     except Exception as e:
-        print(f"警告：项目映射读取失败（{path}）：{e}", file=sys.stderr)
+        print(f"警告：项目映射读取失败（{redact_text(str(path), 'strict')}）："
+              f"{safe_error(e)}", file=sys.stderr)
         return {}
 
 
@@ -193,11 +194,19 @@ def write_text_atomic(path: str, text: str) -> None:
     """先写临时文件再替换，避免进程中断留下半截文件。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        # 替换失败时不要把含正文的临时文件留在磁盘上
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def lock_or_report(cfg: Config) -> Optional[ProcessLock]:
@@ -205,7 +214,8 @@ def lock_or_report(cfg: Config) -> Optional[ProcessLock]:
     lock = ProcessLock(cfg.lock_file)
     if lock.acquire():
         return lock
-    print(f"另一个 SessionDigest 进程正在运行（锁：{cfg.lock_file}）。\n"
+    print(f"另一个 SessionDigest 进程正在运行"
+          f"（锁：{redact_text(str(cfg.lock_file), 'strict')}）。\n"
           f"等它结束后再试；如果确认没有进程在跑，删掉该文件即可。",
           file=sys.stderr)
     return None
@@ -302,6 +312,89 @@ def redact_text(text: str, mode: str = "strict") -> str:
     if mode == "strict":
         text = _redact_paths(text)
     return text
+
+
+def safe_error(exc, mode: str = "strict") -> str:
+    """异常信息也可能带路径或密钥，打印前统一脱敏。"""
+    return redact_text(str(exc), mode)
+
+
+# 路径引用：元数据里只存“根目录 + 相对路径”，不存绝对路径。
+# 根目录名固定，改配置后 ref 可能失效，调用方回退旧的绝对路径字段。
+_REF_ROOTS = ("obsidian", "memory", "out", "claude", "codex")
+
+
+def _root_dir(cfg: Config, root: str) -> Optional[str]:
+    return {
+        "obsidian": cfg.obsidian_dir,
+        "memory": cfg.memory_dir,
+        "out": cfg.out_dir,
+        "claude": cfg.claude_root,
+        "codex": cfg.codex_root,
+    }.get(root)
+
+
+def _abs_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _is_within(path: str, root: str) -> bool:
+    """path 是否在 root 之内（大小写不敏感，跨盘符返回 False）。"""
+    if not path or not root:
+        return False
+    try:
+        p = os.path.normcase(_abs_path(path))
+        r = os.path.normcase(_abs_path(root))
+        return os.path.commonpath([p, r]) == r
+    except (ValueError, TypeError):
+        return False
+
+
+def make_path_ref(cfg: Config, path: Optional[str],
+                  preferred: Optional[str] = None) -> Optional[dict]:
+    """把绝对路径转成 {root, rel}；不在已知根目录内则返回 None。"""
+    if not path:
+        return None
+    order = ([preferred] if preferred else []) + \
+            [r for r in _REF_ROOTS if r != preferred]
+    for root in order:
+        base = _root_dir(cfg, root)
+        if not base or not _is_within(path, base):
+            continue
+        try:
+            rel = os.path.relpath(_abs_path(path), _abs_path(base))
+        except ValueError:
+            continue
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            continue
+        return {"root": root, "rel": rel.replace("\\", "/")}
+    return None
+
+
+def resolve_path_ref(cfg: Config, ref) -> Optional[str]:
+    """把 {root, rel} 还原成绝对路径；越界或结构不对返回 None。"""
+    if not isinstance(ref, dict):
+        return None
+    root = _root_dir(cfg, ref.get("root"))
+    rel = ref.get("rel")
+    if not root or not isinstance(rel, str) or not rel:
+        return None
+    base = _abs_path(root)
+    path = os.path.abspath(os.path.join(base, *rel.split("/")))
+    return path if _is_within(path, base) else None
+
+
+def resolve_meta_path(cfg: Config, rec: dict, key: str) -> Optional[str]:
+    """优先用 ref，解析不到再回退旧版绝对路径字段。"""
+    if not isinstance(rec, dict):
+        return None
+    path = resolve_path_ref(cfg, rec.get(key + "_ref"))
+    if path and os.path.exists(path):
+        return path
+    legacy = rec.get(key)
+    if isinstance(legacy, str) and legacy:
+        return os.path.expanduser(legacy)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +994,7 @@ def call_llm(cfg: Config, prompt: str, max_tokens: int = 8000, timeout: int = 30
 
 def summarize_one(cfg: Config, info: dict, label: str):
     transcript = redact_text(build_transcript(info), cfg.redact)
+    label = redact_text(label, cfg.redact)
     text, usage = call_llm(cfg, summary_prompt(info, label, transcript))
     return text, usage, len(transcript)
 
@@ -1140,15 +1234,17 @@ def update_index(cfg: Config, info: dict, label: str, text: str, sid: str,
     if not path and cfg.memory_dir:
         month = first_date_of(info)[:7] or datetime.now().strftime("%Y-%m")
         path = os.path.join(cfg.memory_dir, "sessions", f"{month}.md")
-    prev = index["sessions"].get(sid) or {}
     index["sessions"][sid] = {
         "date": (info.get("_first_date") or info.get("start")),
-        "project": label,
+        "project": redact_text(label, cfg.redact),
         "platform": info.get("kind"),
         "title": redact_text(title_of(info), cfg.redact),
         "sid": sid,
-        "file": path,
-        "source": source,
+        "file": redact_text(path or "", cfg.redact),
+        "source": redact_text(source or "", cfg.redact),
+        "file_ref": make_path_ref(cfg, path, "obsidian"),
+        "source_ref": make_path_ref(
+            cfg, source, "claude" if info.get("kind") == "claude" else "codex"),
         "mode": mode,
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1174,7 +1270,9 @@ def record_failure(cfg: Config, key: str, path: str, error: str,
     failures = load_failures(cfg)
     ent = failures.get(key) or {"attempts": 0}
     ent.update({
-        "path": path,
+        "path": redact_text(str(path or ""), cfg.redact),
+        "path_ref": make_path_ref(
+            cfg, path, "claude" if kind == "claude" else "codex"),
         "kind": kind,
         "error": redact_text(str(error), cfg.redact)[:500],
         "attempts": int(ent.get("attempts", 0)) + 1,
@@ -1207,6 +1305,98 @@ def load_state(cfg: Config) -> dict:
 def save_state(cfg: Config, state: dict) -> None:
     write_text_atomic(cfg.state_file,
                       json.dumps(state, ensure_ascii=False, indent=1))
+
+
+def scrub_state(cfg: Config, state: dict) -> bool:
+    """原地脱敏旧 state 条目，并补 source_ref；返回是否有改动。"""
+    changed = False
+    for entry in state.values():
+        if not isinstance(entry, dict):
+            continue
+        raw_source = entry.get("source")
+        if raw_source and "source_ref" not in entry:
+            ref = make_path_ref(cfg, raw_source)
+            if ref:
+                entry["source_ref"] = ref
+                changed = True
+        for key in ("first_title", "source"):
+            value = entry.get(key)
+            if not isinstance(value, str):
+                continue
+            clean = redact_text(value, cfg.redact)
+            if clean != value:
+                entry[key] = clean
+                changed = True
+    return changed
+
+
+def migrate_index(cfg: Config, index: dict) -> bool:
+    """旧索引只存绝对路径；先从原始值生成 ref，再脱敏字段。幂等。"""
+    changed = False
+    sessions = index.get("sessions")
+    if not isinstance(sessions, dict):
+        return False
+    for rec in sessions.values():
+        if not isinstance(rec, dict):
+            continue
+        for key in ("file", "source"):
+            raw = rec.get(key)
+            if raw and key + "_ref" not in rec:
+                ref = make_path_ref(cfg, raw)
+                if ref:
+                    rec[key + "_ref"] = ref
+                    changed = True
+            if isinstance(raw, str):
+                clean = redact_text(raw, cfg.redact)
+                if clean != raw:
+                    rec[key] = clean
+                    changed = True
+        for key in ("project", "title"):
+            value = rec.get(key)
+            if isinstance(value, str):
+                clean = redact_text(value, cfg.redact)
+                if clean != value:
+                    rec[key] = clean
+                    changed = True
+    return changed
+
+
+def migrate_failures(cfg: Config, failures: dict) -> bool:
+    """旧失败队列的 path 是明文绝对路径；补 ref 后脱敏。幂等。"""
+    changed = False
+    for entry in failures.values():
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("path")
+        if raw and "path_ref" not in entry:
+            ref = make_path_ref(cfg, raw)
+            if ref:
+                entry["path_ref"] = ref
+                changed = True
+        if isinstance(raw, str):
+            clean = redact_text(raw, cfg.redact)
+            if clean != raw:
+                entry["path"] = clean
+                changed = True
+    return changed
+
+
+def migrate_metadata(cfg: Config) -> bool:
+    """非 dry-run 入口统一调用；只在确有改动时写盘。"""
+    changed = False
+    state = load_state(cfg)
+    if scrub_state(cfg, state):
+        save_state(cfg, state)
+        changed = True
+    index = load_index(cfg)
+    if migrate_index(cfg, index):
+        save_index(cfg, index)
+        changed = True
+    failures = load_failures(cfg)
+    if migrate_failures(cfg, failures):
+        save_failures(cfg, failures)
+        changed = True
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1357,8 +1547,9 @@ def print_plan(tasks, notes: Optional[List[str]] = None) -> None:
           f"（输出另计，按你所用模型的价格收费）")
     for t in tasks:
         mode = {"full": "全量", "incremental": "续写", "merge": "合并"}[t.mode]
-        print(f"  [{mode}] [{t.label}] {t.info.get('start')} · "
-              f"{t.info.get('turns')} 条消息 · {os.path.basename(t.path)}")
+        print(f"  [{mode}] [{redact_text(t.label, 'strict')}] "
+              f"{t.info.get('start')} · {t.info.get('turns')} 条消息 · "
+              f"{redact_text(os.path.basename(t.path), 'strict')}")
     for n in notes or []:
         print(f"  · {n}")
 
@@ -1376,7 +1567,8 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
     prev_entry = state.get(sid) or {}
     info = dict(task.info)
     info["_first_date"] = prev_entry.get("first_date") or info.get("start")
-    info["_first_title"] = prev_entry.get("first_title") or title_of(info)
+    info["_first_title"] = redact_text(
+        prev_entry.get("first_title") or title_of(info), cfg.redact)
 
     try:
         if task.mode == "full":
@@ -1389,18 +1581,18 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
 
         elif task.mode == "incremental":
             delta = redact_text(build_transcript(info), cfg.redact)
-            prompt = continuation_prompt(task.prev_summary or "", info, delta,
-                                         _today(info))
+            prev = redact_text(task.prev_summary or "", cfg.redact)
+            prompt = continuation_prompt(prev, info, delta, _today(info))
             text, usage = call_llm(cfg, prompt)
-            text = checked_summary(cfg, text, info, task.prev_summary or "")
-            append_continuation(cfg, info, task.label, text, sid,
-                                task.prev_summary or "")
+            text = checked_summary(cfg, text, info, prev)
+            append_continuation(cfg, info, task.label, text, sid, prev)
             sections = task.sections + 1
             print(f"  续写 {len(delta)} 字符 -> in={usage.get('input_tokens')} "
                   f"out={usage.get('output_tokens')}（第 {sections} 段）")
 
         else:  # merge
-            text, usage = call_llm(cfg, merge_prompt(task.prev_summary or ""))
+            prev = redact_text(task.prev_summary or "", cfg.redact)
+            text, usage = call_llm(cfg, merge_prompt(prev))
             text = checked_summary(cfg, text, info)
             write_full(cfg, info, task.label, text, sid)
             sections = 0
@@ -1418,8 +1610,10 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
             "sections": sections,
             "date": info.get("_first_date"),
             "first_date": info.get("_first_date"),
-            "first_title": info.get("_first_title"),
-            "source": task.path,
+            "first_title": redact_text(info.get("_first_title") or "", cfg.redact),
+            "source": redact_text(task.path, cfg.redact),
+            "source_ref": make_path_ref(
+                cfg, task.path, "claude" if task.kind == "claude" else "codex"),
             "tokens": usage,
             "done_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -1429,10 +1623,11 @@ def execute_task(cfg: Config, task: Task, state: dict) -> bool:
         return True
 
     except Exception as e:
-        print("  失败:", e, file=sys.stderr)
+        print("  失败:", safe_error(e, cfg.redact), file=sys.stderr)
         if cfg.verbose:
             import traceback
-            traceback.print_exc()
+            print(redact_text(traceback.format_exc(), cfg.redact),
+                  file=sys.stderr)
         record_failure(cfg, sid, task.path, e, task.kind)
         return False
 
@@ -1451,19 +1646,23 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
           f"（输出另计，按你所用模型的价格收费）")
     if dry:
         for info, label, _kind, path, _key in todo:
-            print(f"  [{label}] {info.get('start')} · {info.get('turns')} 条消息 · {path}")
+            print(f"  [{redact_text(label, cfg.redact)}] {info.get('start')} · "
+                  f"{info.get('turns')} 条消息 · "
+                  f"{redact_text(path, cfg.redact)}")
         return 0
 
     os.makedirs(cfg.out_dir, exist_ok=True)
     for i, (info, label, kind, path, key) in enumerate(todo, 1):
-        print(f"[{i}/{len(todo)}] {label} | {info.get('start')} | {info.get('turns')} 条消息")
+        print(f"[{i}/{len(todo)}] {redact_text(label, cfg.redact)} | "
+              f"{info.get('start')} | {info.get('turns')} 条消息")
         try:
             text, usage, nchars = summarize_one(cfg, info, label)
         except Exception as e:
-            print("  失败:", e, file=sys.stderr)
+            print("  失败:", safe_error(e, cfg.redact), file=sys.stderr)
             if cfg.verbose:
                 import traceback
-                traceback.print_exc()
+                print(redact_text(traceback.format_exc(), cfg.redact),
+                      file=sys.stderr)
             continue
         text = checked_summary(cfg, text, info)
         date = (info.get("start") or "unknown").split(" ")[0]
@@ -1478,7 +1677,8 @@ def cmd_preview(cfg: Config, n: int, dry: bool) -> int:
         ])
         write_text_atomic(out, redact_text(doc, cfg.redact))
         print(f"  {nchars} 字符 -> in={usage.get('input_tokens')} "
-              f"out={usage.get('output_tokens')} -> {out}")
+              f"out={usage.get('output_tokens')} -> "
+              f"{redact_text(out, cfg.redact)}")
     return 0
 
 
@@ -1499,6 +1699,8 @@ def cmd_nightly(cfg: Config, dry: bool) -> int:
 
 
 def _run_nightly(cfg: Config, dry: bool) -> int:
+    if not dry:
+        migrate_metadata(cfg)
     state = load_state(cfg)
     failures = load_failures(cfg)
     retry = [k for k, v in failures.items() if int(v.get("attempts", 0)) < 3]
@@ -1512,7 +1714,7 @@ def _run_nightly(cfg: Config, dry: bool) -> int:
             if key in planned:
                 continue
             f = failures[key]
-            p = f.get("path")
+            p = resolve_meta_path(cfg, f, "path")
             if not p or not os.path.exists(p):
                 continue
             kind = f.get("kind") or "claude"
@@ -1534,8 +1736,8 @@ def _run_nightly(cfg: Config, dry: bool) -> int:
 
     done = 0
     for i, task in enumerate(tasks, 1):
-        print(f"[{i}/{len(tasks)}] {task.label} | {task.info.get('start')} | "
-              f"{task.info.get('turns')} 条消息")
+        print(f"[{i}/{len(tasks)}] {redact_text(task.label, cfg.redact)} | "
+              f"{task.info.get('start')} | {task.info.get('turns')} 条消息")
         if execute_task(cfg, task, state):
             done += 1
 
@@ -1563,10 +1765,12 @@ def cmd_retry_failed(cfg: Config, dry: bool) -> int:
 
 
 def _run_retry_failed(cfg: Config, failures: dict) -> int:
+    migrate_metadata(cfg)
+    failures = load_failures(cfg)
     state = load_state(cfg)
     done = 0
     for key, v in list(failures.items()):
-        path = v.get("path")
+        path = resolve_meta_path(cfg, v, "path")
         if not path or not os.path.exists(path):
             print(f"  跳过 {key[:8]}：源文件不存在")
             continue
@@ -1577,7 +1781,8 @@ def _run_retry_failed(cfg: Config, failures: dict) -> int:
         task = Task(info=info, label=project_label(info, None, cfg.projects),
                     kind=kind, path=path, key=key, mode="full",
                     new_offset=os.path.getsize(path))
-        print(f"[{key[:8]}] {task.label} | {info.get('start')}")
+        print(f"[{key[:8]}] {redact_text(task.label, cfg.redact)} | "
+              f"{info.get('start')}")
         if execute_task(cfg, task, state):
             done += 1
     print(f"完成 {done} 项")
@@ -1586,7 +1791,7 @@ def _run_retry_failed(cfg: Config, failures: dict) -> int:
 
 def summary_text(cfg: Config, rec: dict) -> str:
     """从索引记录里读回一份摘要的正文（去掉 frontmatter）。"""
-    path = rec.get("file")
+    path = resolve_meta_path(cfg, rec, "file")
     if not path or not os.path.exists(path):
         return ""
     try:
@@ -1594,13 +1799,13 @@ def summary_text(cfg: Config, rec: dict) -> str:
             raw = fh.read()
     except Exception:
         return ""
-    monthly_root = os.path.normpath(
-        os.path.join(cfg.memory_dir, "sessions")) if cfg.memory_dir else ""
-    is_monthly = monthly_root and os.path.normpath(path).startswith(monthly_root)
+    monthly_root = os.path.join(cfg.memory_dir, "sessions") if cfg.memory_dir else ""
+    is_monthly = bool(monthly_root) and _is_within(path, monthly_root)
     text = block_text(raw, rec.get("sid", "")) if is_monthly \
         else strip_frontmatter(raw)
     # 顺手去掉正文开头的一级标题，避免和输出里的“## 日期 · 项目”重复
-    return re.sub(r"^\s*# [^\n]*\n+", "", text, count=1)
+    text = re.sub(r"^\s*# [^\n]*\n+", "", text or "", count=1)
+    return redact_text(text, cfg.redact)
 
 
 # 中文用相邻二字切词（不依赖分词库），英文/数字按词切
@@ -1637,11 +1842,17 @@ def _docs_from_vault(cfg: Config) -> List[dict]:
                 raw = fh.read()
         except Exception:
             continue
+        # 只索引本工具生成的摘要，避免把 vault 里的普通笔记拉进 --find。
+        if not _frontmatter_value(raw, "session"):
+            continue
+        tags = _frontmatter_value(raw, "tags")
+        if "自动摘要" not in tags and "关键标识符" not in raw:
+            continue
         docs.append({
             "sid": _frontmatter_value(raw, "session"),
             "date": _frontmatter_value(raw, "date"),
-            "project": _frontmatter_value(raw, "project"),
-            "title": _frontmatter_value(raw, "title"),
+            "project": redact_text(_frontmatter_value(raw, "project"), cfg.redact),
+            "title": redact_text(_frontmatter_value(raw, "title"), cfg.redact),
             "file": path,
         })
     return docs
@@ -1695,21 +1906,26 @@ def search_summaries(cfg: Config, query: str, top: int,
     return scored[:top]
 
 
+def _display(cfg: Config, value) -> str:
+    return redact_text("" if value is None else str(value), cfg.redact)
+
+
 def cmd_find(cfg: Config, query: str, top: int, project: Optional[str]) -> int:
     if not text_tokens(query):
         print("查询词太短：至少给一个中文词或两个以上字母/数字。", file=sys.stderr)
         return 2
     results = search_summaries(cfg, query, top, project)
     if not results:
-        print(f"没有找到与「{query}」相关的摘要。", file=sys.stderr)
+        print(f"没有找到与「{_display(cfg, query)}」相关的摘要。", file=sys.stderr)
         print("提示：这是关键词匹配，不是语义检索；换个更具体的词试试，"
               "或者先跑 --nightly 生成摘要。", file=sys.stderr)
         return 1
-    print(f"# 与「{query}」相关的 {len(results)} 份摘要\n")
+    print(f"# 与「{_display(cfg, query)}」相关的 {len(results)} 份摘要\n")
     for r in results:
         rec = r["rec"]
-        print(f"## {str(rec.get('date', ''))[:10]} · {rec.get('project', '')} · "
-              f"{rec.get('title', '')}  （相关度 {r['score']:.1f}）")
+        print(f"## {_display(cfg, str(rec.get('date', ''))[:10])} · "
+              f"{_display(cfg, rec.get('project'))} · "
+              f"{_display(cfg, rec.get('title'))}  （相关度 {r['score']:.1f}）")
         print()
         print(r["text"].strip())
         print("\n---")
@@ -1729,7 +1945,8 @@ def cmd_context(cfg: Config, n: int, project: Optional[str]) -> int:
 
     for v in items:
         text = summary_text(cfg, v)
-        print(f"\n## {v.get('date', '')[:10]} · {v.get('project', '')} · {v.get('title', '')}")
+        print(f"\n## {_display(cfg, str(v.get('date', ''))[:10])} · "
+              f"{_display(cfg, v.get('project'))} · {_display(cfg, v.get('title'))}")
         print()
         print(text.strip() or "（摘要文件缺失）")
         print("\n---")
@@ -1747,6 +1964,7 @@ def cmd_export(cfg: Config) -> int:
 
 
 def _run_export(cfg: Config) -> int:
+    migrate_metadata(cfg)
     idx = {"claude": OrderedDict(), "codex": OrderedDict()}
     total = 0
     index = load_index(cfg)
@@ -1755,7 +1973,8 @@ def _run_export(cfg: Config) -> int:
         info = parse_session(f, kind)
         if not info["turns"] and not info["prompts"]:
             continue
-        label = project_label(info, proj_dir, cfg.projects)
+        label = redact_text(
+            project_label(info, proj_dir, cfg.projects), cfg.redact)
         sid = session_key(info, f)
         title = redact_text(title_of(info), cfg.redact)
         fname = f"{sid[:8]}_{_safe_name(title)}.md"
@@ -1768,8 +1987,13 @@ def _run_export(cfg: Config) -> int:
         total += 1
         index["sessions"][sid] = {
             "date": info.get("start"), "project": label, "platform": kind,
-            "title": title, "sid": sid, "file": out, "source": f,
-            "mode": "export", "updated": datetime.now().isoformat(timespec="seconds"),
+            "title": title, "sid": sid,
+            "file": redact_text(out, cfg.redact),
+            "source": redact_text(f, cfg.redact),
+            "file_ref": make_path_ref(cfg, out, "out"),
+            "source_ref": make_path_ref(cfg, f, kind),
+            "mode": "export",
+            "updated": datetime.now().isoformat(timespec="seconds"),
         }
 
     lines = ["---", "title: 会话记忆库", "tags: [index]", "---", "",
@@ -1789,10 +2013,10 @@ def _run_export(cfg: Config) -> int:
             lines.append("")
 
     os.makedirs(cfg.out_dir, exist_ok=True)
-    with open(os.path.join(cfg.out_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    write_text_atomic(os.path.join(cfg.out_dir, "README.md"),
+                      redact_text("\n".join(lines), cfg.redact))
     save_index(cfg, index)
-    print(f"导出完成：{total} 场会话 -> {cfg.out_dir}")
+    print(f"导出完成：{total} 场会话 -> {redact_text(cfg.out_dir, cfg.redact)}")
     return 0
 
 
