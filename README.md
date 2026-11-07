@@ -58,7 +58,7 @@
 需要 Python 3.8+，无第三方依赖。
 
 ```bash
-git clone https://github.com/<you>/claude-session-digest.git
+git clone https://github.com/Scanenf/claude-session-digest.git
 cd claude-session-digest
 
 # 设置模型凭证（二选一）
